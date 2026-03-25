@@ -19,16 +19,19 @@ def create_collector_agent(model_tier: str = "primary"):
     return Agent(
         role="B2B Lead Collector",
         goal=(
-            "Find 5+ unique leads from different companies using web search. "
-            "Run multiple searches. Never repeat the same company twice. "
+            "Find 10-15 UNIQUE leads from different companies using web search. "
+            "Run multiple searches with different angles. "
+            "Never repeat the same company twice. "
             "Return real names with source URLs."
         ),
         backstory=(
-            "You are an expert B2B data sourcing specialist. "
-            "You find real decision-makers on the web."
+            "You are an expert B2B data sourcing specialist with access to multiple "
+            "search strategies. You use variations in search terms, explore different "
+            "sources (news, LinkedIn, Crunchbase, tech blogs), and cross-reference "
+            "information to find hidden decision-makers."
         ),
         tools=[TavilySearchTool(), CrawleeTool()],
         llm=model,
         verbose=True,
-        max_iter=8
+        max_iter=12
     )
