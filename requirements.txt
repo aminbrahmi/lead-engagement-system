@@ -1,0 +1,12 @@
+crewai
+langchain-groq
+tavily-python 
+chromadb 
+beautifulsoup4 
+requests 
+python-dotenv 
+fastapi 
+uvicorn 
+streamlit
+litellm
+crawlee[playwright]
