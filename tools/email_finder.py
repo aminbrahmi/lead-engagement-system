@@ -3,9 +3,12 @@ import os
 import re
 import requests
 import smtplib
+import logging
 from crewai.tools import BaseTool
 from typing import Type
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 class EmailFinderInput(BaseModel):
     query: str = Field(description="Format: 'FirstName LastName | domain.com'")
@@ -119,8 +122,8 @@ class EmailFinderTool(BaseTool):
             email = resp.json().get("person", {}).get("email")
             if email and "@" in email:
                 return email
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"[Apollo] Request failed: {e}")
         return None
 
     def _patterns(self, name: str, domain: str) -> list:
@@ -140,7 +143,9 @@ class EmailFinderTool(BaseTool):
         try:
             import dns.resolver
         except ImportError:
+            logger.warning("[EmailFinder] dnspython not installed — SMTP verify skipped")
             return None
+
         for email in emails:
             domain = email.split("@")[1]
             try:
@@ -152,7 +157,14 @@ class EmailFinderTool(BaseTool):
                     code, _ = smtp.rcpt(email)
                     if code == 250:
                         return email
-            except:
+            except dns.resolver.NXDOMAIN:
+                logger.debug(f"[SMTP] No MX record for {domain}")
+            except smtplib.SMTPConnectError as e:
+                # Port 25 is blocked on most cloud providers (AWS, GCP, Azure)
+                logger.warning(f"[SMTP] Connection failed for {domain} — port 25 likely blocked: {e}")
+                break  # No point retrying if port is blocked
+            except Exception as e:
+                logger.debug(f"[SMTP] Verify failed for {email}: {type(e).__name__}: {e}")
                 continue
         return None
 
@@ -183,6 +195,6 @@ class EmailFinderTool(BaseTool):
                         if any(s in email.lower() for s in SKIP):
                             continue
                         return email
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"[Scrape] Failed for {domain}: {e}")
         return None

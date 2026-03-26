@@ -1,3 +1,4 @@
+# memory/storage.py
 import sqlite3
 import json
 import os
@@ -26,8 +27,6 @@ def init_db():
             notes        TEXT,
             email        TEXT,
             email_source TEXT,
-            phone        TEXT,
-            phone_source TEXT,
             campaign     TEXT,
             status       TEXT DEFAULT 'collected',
             score        INTEGER DEFAULT 0,
@@ -260,7 +259,7 @@ def is_duplicate(name: str, company: str) -> bool:
 
 def update_lead_qualification(qualified_leads: list) -> int:
     """
-    Update score, segment, email, phone for each qualified lead.
+    Update score, segment, email for each qualified lead.
     Uses company-only ID — immune to name changes between Agent 1 and Agent 2.
     Also writes the resolved name back (was 'unknown' at collection time).
     """
@@ -288,8 +287,6 @@ def update_lead_qualification(qualified_leads: list) -> int:
                 status       = ?,
                 email        = ?,
                 email_source = ?,
-                phone        = ?,
-                phone_source = ?,
                 reason       = ?,
                 updated_at   = ?
             WHERE id = ?
@@ -300,8 +297,6 @@ def update_lead_qualification(qualified_leads: list) -> int:
             status,
             lead.get("email"),
             lead.get("email_source"),
-            lead.get("phone"),
-            lead.get("phone_source"),
             lead.get("reason"),
             now,
             lead_id
@@ -351,8 +346,6 @@ def _sync_json_with_qualification(qualified_leads: list):
             entry["status"]       = "qualified" if q.get("keep") else "rejected"
             entry["email"]        = q.get("email")
             entry["email_source"] = q.get("email_source")
-            entry["phone"]        = q.get("phone")
-            entry["phone_source"] = q.get("phone_source")
             entry["reason"]       = q.get("reason")
             entry["qualified_at"] = datetime.now().isoformat()
             updated_count += 1

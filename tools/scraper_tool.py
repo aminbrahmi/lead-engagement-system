@@ -1,3 +1,4 @@
+# tools/scraper_tool.py
 import asyncio
 import nest_asyncio
 from crewai.tools import BaseTool

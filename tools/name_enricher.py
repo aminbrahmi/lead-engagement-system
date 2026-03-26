@@ -1,3 +1,4 @@
+# tools/name_enricher.py
 import os
 import re
 import requests
@@ -86,10 +87,18 @@ class NameEnricherTool(BaseTool):
                         {"role": "system",
                          "content": "Extract person names from text. Reply with ONLY a full name or NOT_FOUND."},
                         {"role": "user",
-                         "content": (f"Who is the {role} or main technical founder of {company}?\n\n"
-                                     f"{text}\n\n"
-                                     f"Rules: Look for {role} first, if not found return co-founder or CEO.\n"
-                                     f"Return ONLY the full name or NOT_FOUND.\n\nName:")}
+                         "content": (
+                            f"Find the most relevant technical leader at {company}.\n\n"
+                            f"Priority order:\n"
+                            f"1. {role}\n"
+                            f"2. CTO\n"
+                            f"3. Co-founder\n"
+                            f"4. Founder\n"
+                            f"5. CEO\n\n"
+                            f"If {role} is not explicitly mentioned, return the closest match.\n\n"
+                            f"{text}\n\n"
+                            f"Return ONLY a full name or NOT_FOUND.\n\nName:"
+                        )}
                     ]
                 },
                 timeout=15

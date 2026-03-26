@@ -1,23 +1,25 @@
+# agents/qualifier.py
 import os
 from crewai import Agent
-from tools.contact_finder import ContactFinderTool
+from tools.email_finder import EmailFinderTool
 from tools.name_enricher import NameEnricherTool
 
 def create_qualifier_agent():
     return Agent(
         role="B2B Lead Qualifier",
         goal=(
-            "For unknown leads, find their real name using NameEnricherTool. "
-            "Then find email AND phone using ContactFinderTool cascade. "
-            "Score and classify each lead as hot/warm/cold."
+            "For each lead with unknown name, find the real name first using NameEnricherTool. "
+            "Then score each lead from 0 to 100. "
+            "Then find emails using EmailFinderTool. "
+            "Filter irrelevant profiles."
         ),
         backstory=(
-            "You are a senior B2B sales strategist with 10 years experience. "
-            "You always find the real person behind each company. "
-            "You use every available tool to find contact information."
+            "You are a senior B2B sales strategist with 10 years of experience. "
+            "You never give up on a lead just because the name is missing. "
+            "You always search for the real person before evaluating the lead."
         ),
-        tools=[NameEnricherTool(), ContactFinderTool()],
-        llm=os.getenv("QUALIFIER_MODEL", "groq/openai/gpt-oss-120b"),
+        tools=[NameEnricherTool(), EmailFinderTool()],
+        llm=os.getenv("QUALIFIER_MODEL", "groq/openai/gpt-oss-20b"),
         verbose=True,
         max_iter=15
     )

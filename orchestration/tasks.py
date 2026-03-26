@@ -1,3 +1,4 @@
+#orchestration/tasks.py
 from crewai import Task
 
 def create_collect_task(collector, campaign_prompt: str, criteria: dict):
@@ -60,6 +61,23 @@ def create_qualify_task(qualifier, campaign_prompt: str, raw_leads: str):
         {raw_leads}
 
         For EACH lead, do the following in order:
+
+        STEP 0 — ENRICH NAME (if the lead name is missing)
+
+        If the extracted lead name is "Unknown", "unknown", empty, or missing:
+
+        1. Call the tool `name_enricher` using the following format:
+        name_enricher("CompanyName | Role | Location")
+
+        2. Replace:
+        - CompanyName → the company of the lead
+        - Role → the target role (CTO, CEO, Founder, etc.)
+        - Location → the target location or city
+
+        3. If the tool returns a valid real name:
+        - Use this name for all subsequent steps (email discovery, validation, outreach).
+
+        4. Apply this enrichment step to EVERY lead whose name is missing BEFORE running the next steps.
 
         STEP 1 — SCORE the lead from 0 to 100:
         - Role match (is it exactly the right role?): 0-30 pts
