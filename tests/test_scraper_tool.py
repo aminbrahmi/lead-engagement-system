@@ -1,34 +1,34 @@
-# tests/test_scraper_tool.py
+# tests/test_scraper.py
 import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from dotenv import load_dotenv
-load_dotenv()
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from tools.search_tool import TavilySearchTool
 from tools.scraper_tool import CrawleeTool
+import time
 
-search = TavilySearchTool()
-scraper = CrawleeTool()
+tool = CrawleeTool()
 
-query = "Cognee Berlin startup funding founders"
+# URLs variées pour tester différents cas
+TEST_URLS = [
+    ("Static simple",   "https://example.com"),
+    ("Page équipe",     "https://www.parloa.com/about"),
+    ("Crunchbase",      "https://www.crunchbase.com/organization/parloa"),
+    ("LinkedIn",        "https://www.linkedin.com/company/parloa"),
+]
 
-print("\n" + "="*60)
-print("  SEARCH → SCRAPE PIPELINE TEST")
-print("="*60)
+for label, url in TEST_URLS:
+    print(f"\n{'='*50}")
+    print(f"[TEST] {label}: {url}")
+    start = time.time()
+    result = tool._run(url)
+    elapsed = time.time() - start
 
-# Step 1 — Search
-results = search._run(query)
-print(f"\n🔎 Search Results:\n{results}")
-
-# Step 2 — Extract first URL
-import re
-urls = re.findall(r'https?://\S+', results)
-
-if urls:
-    url = urls[0]
-    print(f"\n🌐 Scraping: {url}")
-
-    content = scraper._run(url)
-    print(f"\n📄 Scraped Content:\n{content[:1000]}")
-else:
-    print("\n❌ No URLs found")
+    print(f"  ⏱  {elapsed:.1f}s")
+    print(f"  📏  {len(result)} chars")
+    print(f"  📄  Preview: {result[:200]}")
+    
+    if "Scraping failed" in result:
+        print("  ❌ FAILED")
+    elif len(result) < 100:
+        print("  ⚠️  TOO SHORT — probably blocked")
+    else:
+        print("  ✅ OK")

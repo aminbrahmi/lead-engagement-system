@@ -1,7 +1,7 @@
 # tools/search_tool.py
 import os
 import requests
-from crewai.tools import BaseTool
+from langchain_core.tools import BaseTool
 from typing import Type
 from pydantic import BaseModel, Field
 

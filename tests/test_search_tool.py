@@ -21,4 +21,4 @@ print("="*60)
 for q in QUERIES:
     print(f"\n🔎 Query: {q}")
     result = tool._run(q)
-    print(f"\n📄 Results:\n{result[:500]}")
+    print(f"\n📄 Results:\n{result[:1000]}")

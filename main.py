@@ -1,13 +1,16 @@
+# main.py
 from dotenv import load_dotenv
 load_dotenv()
 
-from orchestration.crew import run_lead_pipeline
+from orchestration.graph import run_lead_pipeline   # ← only import changes
 
 if __name__ == "__main__":
-    campaign = input("Décris ta campagne : ")
-    # Exemple : "Je veux contacter des CTOs dans des scale-ups parisiennes de plus de 50 employés qui ont récemment levé des fonds"
-
-    result = run_lead_pipeline(campaign)
+    campaign = input("Describe your campaign : ")
+    result   = run_lead_pipeline(campaign)
 
     print("\n===== LEADS COLLECTÉS =====")
-    print(result)
+    # result is now the full state dict; qualified_leads holds the final list
+    qualified = result.get("qualified_leads", [])
+    print(f"{len(qualified)} leads qualified.")
+    for lead in qualified:
+        print(f"  [{lead.get('segment','?').upper():4}] {lead.get('company')} / {lead.get('name')} — {lead.get('email','no email')}")

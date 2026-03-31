@@ -18,6 +18,11 @@ TEST_LEADS = [
     {"name": "Adam Bahlke",        "domain": "motorai.de"},
     {"name": "Anna Mayer",         "domain": "deepscale.com"},
     {"name": "Thomas Schreiber",   "domain": "neurotech.com"},
+    {"name": "Alexander Matthey",  "domain": "parloa.com"},
+    {"name": "Tobias Siwonia",     "domain": "peec.ai"},
+    {"name": "Brad Heller",        "domain": "tower.com"},
+    {"name": "Onur Eken",          "domain": "needle.com"},
+    {"name": "Boris Arzentar",     "domain": "Cognee.ai"},
 ]
 
 tool = EmailFinderTool()

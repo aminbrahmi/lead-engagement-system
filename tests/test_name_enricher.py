@@ -19,6 +19,7 @@ UNKNOWNS = [
     "Stripe | CEO | San Francisco",
     "Mistral AI | CTO | Paris",
     "Instadeep | CEO | Tunis",
+    "Talan | CEO | Tunis",
 ]
 
 print("\n" + "="*60)
