@@ -1,13 +1,33 @@
+# requirements.txt
+
+langchain-ollama        # NEW: replaces langchain-groq for Ollama models
+
+# Ollama Python client (for prompt_parser and name_enricher direct calls)
+ollama
+ 
+# Search / enrichment
+requests
+tavily-python
+ 
+# Storage
+chromadb
+ 
+# Validation
+pydantic
+ 
+# DNS for SMTP verify
+dnspython
+ 
+# Utils
+python-dotenv
 langgraph>=0.2.0
 langchain>=0.3.0
 langchain-core>=0.3.0
 langchain-groq>=0.2.0
 langchain-google-genai>=2.0.0
 langchain-groq
-tavily-python 
 chromadb 
 beautifulsoup4 
-requests 
 python-dotenv 
 fastapi 
 uvicorn 

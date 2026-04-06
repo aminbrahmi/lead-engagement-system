@@ -1,12 +1,19 @@
-# tools/email_finder.py
+"""
+email_finder.py — exhaustive multi-source email finder.
+
+Instead of returning on the first hit, ALL sources run and collect candidates.
+Each candidate gets a confidence score. The highest-confidence SMTP-verified
+email wins; if nothing verifies, the highest raw score wins.
+"""
 
 import os
 import re
 import json
-import requests
+import socket
 import logging
 import smtplib
-from typing import Type, Optional, List, Tuple
+import requests
+from typing import Type, Optional, List
 from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool
 from requests.adapters import HTTPAdapter
@@ -14,361 +21,340 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
-# =========================
-# INPUT
-# =========================
+# ── Junk domains — never valid company emails ─────────────────────────────────
+_JUNK_DOMAINS = {
+    # Social / video
+    "youtube.com","twitter.com","x.com","facebook.com","instagram.com",
+    "linkedin.com","tiktok.com","vimeo.com",
+    # News / tech media / aggregators
+    "crunchbase.com","techcrunch.com","techfundingnews.com","heise.de",
+    "trendingtopics.eu","vestbee.com","cybernewscentre.com","mezha.net",
+    "eu-startups.com","sifted.eu","wired.com","forbes.com",
+    "businessinsider.com","venturebeat.com","zdnet.com","cnet.com",
+    "thenextweb.com","siliconrepublic.com","techradar.com","theverge.com",
+    "musicbusinessworldwide.com","billboard.com","variety.com",
+    "reuters.com","bloomberg.com","ft.com","wsj.com","nytimes.com",
+    "handelsblatt.com","gruenderszene.de","deutsche-startups.de",
+    # Events / community
+    "hyperight.com","eventbrite.com","meetup.com","lu.ma",
+    # Publishing / hosting
+    "medium.com","substack.com","wordpress.com","ghost.io",
+    "github.com","gitlab.com","notion.so","airtable.com",
+}
+
+
 class EmailFinderInput(BaseModel):
     query: str = Field(description="Format: 'Full Name | domain.com | Company'")
 
 
-# =========================
-# TOOL
-# =========================
 class EmailFinderTool(BaseTool):
-    name: str = "email_finder"
-    description: str = "Find email using multi-source cascade with SMTP validation"
+    name: str        = "email_finder"
+    description: str = "Exhaustive multi-source email finder — tries everything, returns best result"
     args_schema: Type[BaseModel] = EmailFinderInput
 
-    # =========================
-    # MAIN
-    # =========================
     def _run(self, query: str) -> str:
         name, domain, company = self._parse_query(query)
-        session = self._create_session()
 
-        errors = []
+        # Resolve real company domain if the passed domain is junk or missing
+        if not domain or domain in _JUNK_DOMAINS:
+            domain = self._resolve_company_domain(company)
 
-        # =========================
-        # 1. FTL
-        # =========================
+        if not domain:
+            return json.dumps({"email": None, "confidence": 0,
+                               "source": None, "status": "no_domain"})
+
+        session    = self._make_session()
+        candidates = []   # list of {email, confidence, source, verified}
+
+        print(f"[EmailFinder] Searching all sources for {name} @ {domain}…")
+
+        # ── 1. FindThatLead ───────────────────────────────────────────────────
         email, conf = self._ftl(session, name, domain)
         if email:
-            return self._finalize(email, conf, "findthatlead")
+            candidates.append({"email": email, "confidence": conf,
+                                "source": "findthatlead"})
+            print(f"[EmailFinder]  FTL      → {email} ({conf}%)")
 
-        # =========================
-        # 2. HUNTER
-        # =========================
-        hunter_result = self._hunter(session, name, domain)
+        # ── 2. Hunter ─────────────────────────────────────────────────────────
+        result = self._hunter(session, name, domain)
+        if result and "email" in result:
+            candidates.append({"email": result["email"],
+                                "confidence": result["confidence"],
+                                "source": "hunter"})
+            print(f"[EmailFinder]  Hunter   → {result['email']} ({result['confidence']}%)")
 
-        if hunter_result:
-            if "error" in hunter_result:
-                errors.append(hunter_result["error"])
-            else:
-                return self._finalize(
-                    hunter_result["email"],
-                    hunter_result["confidence"],
-                    "hunter"
-                )
-
-        # =========================
-        # 3. APOLLO
-        # =========================
+        # ── 3. Apollo ─────────────────────────────────────────────────────────
         email = self._apollo(session, name, domain)
         if email:
-            return self._finalize(email, 85, "apollo")
+            candidates.append({"email": email, "confidence": 85, "source": "apollo"})
+            print(f"[EmailFinder]  Apollo   → {email}")
 
-        # =========================
-        # 4. GOOGLE
-        # =========================
-        email = self._google(session, name, domain, company)
-        if email:
-            return self._finalize(email, 70, "google")
+        # ── 4. Tavily / Google search ─────────────────────────────────────────
+        emails = self._tavily(session, name, domain, company)
+        for e in emails:
+            candidates.append({"email": e, "confidence": 70, "source": "google"})
+            print(f"[EmailFinder]  Tavily   → {e}")
 
-        # =========================
-        # 5. SCRAPING
-        # =========================
-        email = self._scrape(domain)
-        if email:
-            return self._finalize(email, 60, "scraping")
+        # ── 5. Website scraping ───────────────────────────────────────────────
+        emails = self._scrape(domain)
+        for e in emails:
+            candidates.append({"email": e, "confidence": 60, "source": "scraping"})
+            print(f"[EmailFinder]  Scrape   → {e}")
 
-        # =========================
-        # 6. SMTP via patterns
-        # =========================
+        # ── 6. Pattern generation ─────────────────────────────────────────────
         patterns = self._patterns(name, domain)
-        email = self._smtp_verify(patterns)
-
-        if email:
-            return json.dumps({
-                "email": email,
-                "confidence": 75,
-                "source": "smtp",
-                "status": "verified"
-            })
-
-        # =========================
-        # 7. fallback pattern
-        # =========================
+        for e in patterns:
+            candidates.append({"email": e, "confidence": 35, "source": "pattern"})
         if patterns:
-            return json.dumps({
-                "email": patterns[0],
-                "confidence": 40,
-                "source": "pattern",
-                "status": "guess",
-                "warning": "Hunter credits exhausted"
-                if "HUNTER_CREDITS_EXCEEDED" in errors else None
-            })
+            print(f"[EmailFinder]  Patterns → {patterns}")
+
+        # ── Deduplicate, filter junk ──────────────────────────────────────────
+        seen       = set()
+        clean      = []
+        for c in candidates:
+            e = c["email"].lower().strip()
+            d = e.split("@")[-1] if "@" in e else ""
+            if e in seen or d in _JUNK_DOMAINS:
+                continue
+            seen.add(e)
+            c["email"] = e
+            clean.append(c)
+
+        if not clean:
+            return json.dumps({"email": None, "confidence": 0,
+                               "source": None, "status": "not_found"})
+
+        # ── SMTP verify all candidates (highest confidence first) ─────────────
+        clean.sort(key=lambda x: x["confidence"], reverse=True)
+
+        print(f"[EmailFinder] SMTP verifying {len(clean)} candidates…")
+        for c in clean:
+            verified = self._smtp_verify(c["email"])
+            c["verified"] = verified
+            status = "✅ verified" if verified else "⚠ unverified"
+            print(f"[EmailFinder]   {c['email']} [{c['source']}] → {status}")
+
+        # ── Pick winner: verified first, then highest confidence ──────────────
+        verified_candidates = [c for c in clean if c["verified"]]
+        winner = (
+            max(verified_candidates, key=lambda x: x["confidence"])
+            if verified_candidates
+            else max(clean, key=lambda x: x["confidence"])
+        )
 
         return json.dumps({
-            "email": None,
-            "confidence": 0,
-            "source": None,
-            "status": "not_found",
-            "errors": errors
+            "email":      winner["email"],
+            "confidence": winner["confidence"],
+            "source":     winner["source"],
+            "status":     "verified" if winner.get("verified") else "unverified",
         })
 
-    # =========================
-    # FINAL VALIDATION
-    # =========================
-    def _finalize(self, email, confidence, source):
-        if not email:
-            return None
+    # ── Domain resolution ─────────────────────────────────────────────────────
 
-        valid = self._smtp_verify([email])
+    def _resolve_company_domain(self, company: str) -> str:
+        """Try common TLDs via DNS; return first that resolves."""
+        slug = re.sub(r'[^a-z0-9]', '', company.lower().split()[0]) if company else ""
+        if not slug:
+            return ""
+        for tld in [".ai", ".io", ".com", ".de", ".co", ".tech"]:
+            domain = slug + tld
+            try:
+                socket.gethostbyname(domain)
+                print(f"[EmailFinder] Resolved company domain: {domain}")
+                return domain
+            except OSError:
+                continue
+        return slug + ".com"
 
-        if valid:
-            return json.dumps({
-                "email": valid,
-                "confidence": confidence,
-                "source": source,
-                "status": "verified"
-            })
+    # ── Session ───────────────────────────────────────────────────────────────
 
-        return json.dumps({
-            "email": email,
-            "confidence": max(confidence - 20, 0),
-            "source": source,
-            "status": "unverified"
-        })
-
-    # =========================
-    # HELPERS
-    # =========================
-    def _parse_query(self, query):
-        parts = query.split("|")
-        name = parts[0].strip()
-        domain = parts[1].strip() if len(parts) > 1 else ""
-        company = parts[2].strip() if len(parts) > 2 else ""
-        domain = self._clean_domain(domain)
-        return name, domain, company
-
-    def _clean_domain(self, domain):
-        return domain.replace("https://", "").replace("www.", "").split("/")[0]
-
-    def _create_session(self):
-        session = requests.Session()
+    def _make_session(self):
+        s       = requests.Session()
         retries = Retry(total=3, backoff_factor=1,
                         status_forcelist=[429, 500, 502, 503, 504])
-        session.mount("https://", HTTPAdapter(max_retries=retries))
-        return session
+        s.mount("https://", HTTPAdapter(max_retries=retries))
+        return s
 
-    # =========================
-    # FTL
-    # =========================
-    def _ftl(self, session, name, domain) -> Tuple[Optional[str], int]:
+    # ── Parse query ───────────────────────────────────────────────────────────
+
+    def _parse_query(self, query: str):
+        parts   = query.split("|")
+        name    = parts[0].strip()
+        domain  = parts[1].strip() if len(parts) > 1 else ""
+        company = parts[2].strip() if len(parts) > 2 else ""
+        domain  = domain.replace("https://","").replace("http://","") \
+                        .replace("www.","").split("/")[0].strip()
+        return name, domain, company
+
+    # ── Source 1: FindThatLead ────────────────────────────────────────────────
+
+    def _ftl(self, session, name: str, domain: str):
         token = os.getenv("FTL_TOKEN")
         if not token:
             return None, 0
-
         try:
-            first, last = name.split()[0], name.split()[-1]
-
+            parts = name.split()
+            first, last = parts[0], parts[-1]
             resp = session.post(
                 "https://app-back-qa.findthatlead.com/search/lead",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "name": first,
-                    "surname": last,
-                    "domain": domain,
-                    "enrich": True
-                },
-                timeout=15
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+                json={"name": first, "surname": last,
+                      "domain": domain, "enrich": True},
+                timeout=20,
             )
-
             if resp.status_code == 200:
                 data = resp.json().get("data", {})
-                for e in data.get("emails", []):
-                    if e.get("valid") and e.get("confidence", 0) >= 70:
-                        return e["email"], e["confidence"]
-
+                # Return the highest-confidence valid email
+                best = max(
+                    (e for e in data.get("emails", []) if e.get("valid")),
+                    key=lambda e: e.get("confidence", 0),
+                    default=None,
+                )
+                if best and best.get("confidence", 0) >= 60:
+                    return best["email"], best["confidence"]
         except Exception as e:
             logger.debug(f"[FTL] {e}")
-
         return None, 0
 
-    # =========================
-    # HUNTER
-    # =========================
-    def _hunter(self, session, name, domain):
+    # ── Source 2: Hunter ──────────────────────────────────────────────────────
+
+    def _hunter(self, session, name: str, domain: str):
         api_key = os.getenv("HUNTER_API_KEY")
         if not api_key:
             return None
-
         try:
             parts = name.split()
-            first = parts[0]
-            last = parts[-1] if len(parts) > 1 else ""
-
+            first, last = parts[0], parts[-1] if len(parts) > 1 else ""
             resp = session.get(
                 "https://api.hunter.io/v2/email-finder",
-                params={
-                    "domain": domain,
-                    "first_name": first,
-                    "last_name": last,
-                    "api_key": api_key
-                },
-                timeout=10
+                params={"domain": domain, "first_name": first,
+                        "last_name": last, "api_key": api_key},
+                timeout=20,
             )
-
-            data = resp.json()
-
-            if resp.status_code in [401, 429] or data.get("errors"):
-                error_msg = data.get("errors", [{}])[0].get("details", "")
-                if "limit" in error_msg.lower():
-                    return {"error": "HUNTER_CREDITS_EXCEEDED"}
-
+            data  = resp.json()
             email = data.get("data", {}).get("email")
-
             if email:
-                return {
-                    "email": email,
-                    "confidence": data.get("data", {}).get("score", 85)
-                }
-
+                return {"email": email,
+                        "confidence": data.get("data", {}).get("score", 80)}
         except Exception as e:
             logger.debug(f"[Hunter] {e}")
-
         return None
 
-    # =========================
-    # APOLLO
-    # =========================
-    def _apollo(self, session, name, domain):
+    # ── Source 3: Apollo ──────────────────────────────────────────────────────
+
+    def _apollo(self, session, name: str, domain: str) -> Optional[str]:
         key = os.getenv("APOLLO_API_KEY")
         if not key:
             return None
-
         try:
-            first, last = name.split()[0], name.split()[-1]
-
-            resp = session.post(
+            parts = name.split()
+            resp  = session.post(
                 "https://api.apollo.io/api/v1/people/match",
                 headers={"X-Api-Key": key},
-                json={
-                    "first_name": first,
-                    "last_name": last,
-                    "domain": domain
-                },
-                timeout=10
+                json={"first_name": parts[0], "last_name": parts[-1],
+                      "domain": domain},
+                timeout=20,
             )
-
             return resp.json().get("person", {}).get("email")
-
-        except:
+        except Exception:
             return None
 
-    # =========================
-    # GOOGLE (FIXED)
-    # =========================
-    def _google(self, session, name, domain, company):
+    # ── Source 4: Tavily search ───────────────────────────────────────────────
+
+    def _tavily(self, session, name: str, domain: str, company: str) -> List[str]:
         key = os.getenv("TAVILY_API_KEY")
         if not key:
-            return None
-
-        EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]+'
-
-        queries = [
-            f'"{name}" {domain} email',
-            f'"{name}" contact {company}',
-            f'{company} email {name}'
+            return []
+        EMAIL_RE = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]+'
+        found    = []
+        queries  = [
+            f'"{name}" {domain} email contact',
+            f'"{name}" {company} email',
+            f'site:{domain} contact email',
         ]
-
         for q in queries:
             try:
-                resp = session.post(
+                resp    = session.post(
                     "https://api.tavily.com/search",
-                    json={"api_key": key, "query": q, "max_results": 5},
-                    timeout=10
+                    json={"api_key": key, "query": q, "max_results": 7},
+                    timeout=15,
                 )
-
-                content = "".join([r.get("content", "") for r in resp.json().get("results", [])])
-
-                for e in re.findall(EMAIL_REGEX, content):
-                    if domain in e:
-                        return e
-
-            except:
+                content = " ".join(r.get("content", "")
+                                   for r in resp.json().get("results", []))
+                for e in re.findall(EMAIL_RE, content):
+                    d = e.split("@")[-1].lower()
+                    if d == domain and e not in found:
+                        found.append(e)
+            except Exception:
                 continue
+        return found
 
-        return None
+    # ── Source 5: Website scraping ────────────────────────────────────────────
 
-    # =========================
-    # SCRAPING (FIXED)
-    # =========================
-    def _scrape(self, domain):
-        EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]+'
-
-        for path in ["/contact", "/about", "/team"]:
+    def _scrape(self, domain: str) -> List[str]:
+        EMAIL_RE = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]+'
+        found    = []
+        paths    = ["/contact", "/about", "/team", "/imprint",
+                    "/impressum", "/kontakt", "/"]
+        headers  = {"User-Agent": "Mozilla/5.0"}
+        for path in paths:
             try:
-                resp = requests.get(f"https://{domain}{path}", timeout=5)
-
-                for e in re.findall(EMAIL_REGEX, resp.text):
-                    if domain in e:
-                        return e
-
-            except:
+                resp = requests.get(f"https://{domain}{path}",
+                                    headers=headers, timeout=10)
+                for e in re.findall(EMAIL_RE, resp.text):
+                    d = e.split("@")[-1].lower()
+                    if d == domain and e not in found:
+                        found.append(e)
+            except Exception:
                 continue
+        return found
 
-        return None
+    # ── Source 6: Pattern generation ─────────────────────────────────────────
 
-    # =========================
-    # PATTERNS
-    # =========================
-    def _patterns(self, name, domain):
+    def _patterns(self, name: str, domain: str) -> List[str]:
         parts = name.lower().split()
         if len(parts) < 2:
             return []
-
         first, last = parts[0], parts[-1]
-
-        return list(set([
+        return list(dict.fromkeys([
             f"{first}.{last}@{domain}",
             f"{first}{last}@{domain}",
+            f"{first[0]}.{last}@{domain}",
             f"{first[0]}{last}@{domain}",
             f"{first}@{domain}",
+            f"{last}@{domain}",
         ]))
 
-    # =========================
-    # SMTP VERIFY
-    # =========================
-    def _smtp_verify(self, emails: List[str]) -> Optional[str]:
+    # ── SMTP verification ─────────────────────────────────────────────────────
+
+    def _smtp_verify(self, email: str) -> bool:
+        """
+        Full SMTP handshake to check if the mailbox exists.
+        Returns True if server responds 250 to RCPT TO.
+        """
         try:
             import dns.resolver
-        except ImportError:
-            return None
-
-        for email in emails[:3]:
-            try:
-                domain = email.split("@")[1]
-                mx_records = dns.resolver.resolve(domain, "MX")
-
-                if not mx_records:
+            domain     = email.split("@")[1]
+            mx_records = dns.resolver.resolve(domain, "MX")
+            if not mx_records:
+                return False
+            # Try all MX records in priority order
+            mx_hosts = sorted(mx_records, key=lambda r: r.preference)
+            for mx_record in mx_hosts[:3]:
+                mx = str(mx_record.exchange).rstrip(".")
+                try:
+                    with smtplib.SMTP(timeout=8) as smtp:
+                        smtp.connect(mx, 25)
+                        smtp.helo("verify.local")
+                        smtp.mail("noreply@verify.local")
+                        code, _ = smtp.rcpt(email)
+                        if code == 250:
+                            return True
+                        if code == 550:
+                            return False   # definitely doesn't exist
+                except Exception:
                     continue
-
-                mx = str(mx_records[0].exchange)
-
-                with smtplib.SMTP(timeout=3) as smtp:
-                    smtp.connect(mx)
-                    smtp.helo("test.com")
-                    smtp.mail("test@test.com")
-                    code, _ = smtp.rcpt(email)
-
-                    if code == 250:
-                        return email
-
-            except:
-                continue
-
-        return None
+        except Exception:
+            pass
+        return False

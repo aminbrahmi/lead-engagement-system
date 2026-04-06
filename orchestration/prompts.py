@@ -66,77 +66,82 @@ def qualifier_user_prompt(campaign_prompt: str, raw_leads: str) -> str:
     return f"""
 Campaign brief: "{campaign_prompt}"
 
-Raw leads to process:
+Raw leads to qualify:
 {raw_leads}
 
-Process ALL leads in order. For EACH lead:
+Process ALL leads. For EACH lead follow these steps:
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 0 — ENRICH NAME (if missing)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If name is "unknown", empty, or missing:
+STEP 0 — ENRICH NAME (only if name is "unknown" or missing)
 → Call name_enricher("Company | Role | Location")
-→ Use the returned name for all next steps
-→ Apply to EVERY lead with missing name BEFORE scoring
+→ Use returned name for all next steps
+→ Enrich ALL missing names before scoring anything
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 1 — SCORE (0 to 100) — BE STRICT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Start from 100 and apply deductions:
+STEP 1 — SCORE strictly from 0 to 100
+Award points in each category:
 
-BASE SCORE: 100
+ROLE MATCH (0-30 pts):
+- Exact role match (CEO, CTO, etc.)     : 30 pts
+- Close match (Co-founder, President)   : 20 pts
+- Different role                        : 0 pts
 
-DEDUCTIONS:
-- Role is not exactly the target role:          -30 pts
-- Location does not match exactly:              -20 pts
-- Company is not a startup/scale-up:            -15 pts
-- Funding is older than 6 months:               -20 pts
-- Source URL is social media (FB, LinkedIn):    -10 pts
-- Name was unknown and had to be enriched:      -10 pts
-- Email will be pattern-based (unverified):     -20 pts
-- No real name found after enrichment:          -20 pts
+LOCATION MATCH (0-20 pts):
+- Exact city/country match              : 20 pts
+- Same country, different city          : 10 pts
+- Different country                     : 0 pts
 
-REALISTIC SCORE EXAMPLES:
-- Real name + verified email + recent funding + exact role = 85-95
-- Real name + pattern email + recent funding + exact role = 65-75
-- Unknown name + no email + old funding = 30-45
+COMPANY FIT (0-20 pts):
+- Right industry + right company type   : 20 pts
+- Right industry only                   : 12 pts
+- Right company type only               : 8 pts
+- Neither                               : 0 pts
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 2 — FIND EMAIL
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Only if score >= 40 AND name is known:
+FUNDING MATCH (0-20 pts):
+- Funding within requested period       : 20 pts
+- Funding exists but period unclear     : 10 pts
+- No funding info found                 : 0 pts
+
+DATA QUALITY (0-10 pts):
+- Real name + verified email            : 10 pts
+- Real name + pattern email             : 6 pts
+- Real name + no email                  : 4 pts
+- Name enriched (was unknown)           : 2 pts
+- No name found                         : 0 pts
+
+CALIBRATION:
+- Perfect match on all criteria = 85-95 (never 100)
+- Strong match with pattern email = 70-80
+- Good match but missing funding info = 55-70
+- Partial match = 40-55
+- Weak match = 20-40
+
+STEP 2 — FIND EMAIL (if score >= 30 AND name is known)
 → Extract domain from source_url or company name
 → Call email_finder("Full Name | domain.com | Company")
-→ Note the source: findthatlead / hunter / apollo / pattern
-→ If name still unknown after enrichment: skip email search
+→ If name still unknown: skip email
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STEP 3 — CLASSIFY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- score >= 70  → segment = "hot",  keep = true
-- score 40-69  → segment = "warm", keep = true
-- score < 40   → segment = "cold", keep = false
+- score >= 70 → segment = "hot",  keep = true
+- score 40-69 → segment = "warm", keep = true
+- score < 40  → segment = "cold", keep = false
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTPUT — return ONLY this JSON, no markdown, no explanation:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Return ONLY raw JSON — no ```json fences, no text before or after:
 [
     {{
         "name": "First Last or unknown",
         "company": "Company name",
         "role": "exact role found",
-        "location": "city, country",
+        "location": "City, Country",
         "source_url": "original URL",
         "email": "email or null",
         "email_source": "findthatlead | hunter | apollo | scraping | pattern | null",
         "score": 0-100,
         "segment": "hot | warm | cold",
-        "reason": "2-3 sentences explaining the score with specific deductions applied",
+        "reason": "2-3 sentences: points awarded per category + any deductions",
         "keep": true or false
     }}
 ]
 
-CRITICAL: Return ALL leads, even cold ones. Never skip a lead.
-CRITICAL: Never give 100/100 — a perfect lead does not exist.
-CRITICAL: Output raw JSON only — no ```json blocks, no text before or after.
+CRITICAL: Return ALL leads including cold ones.
+CRITICAL: Never output 100/100.
+CRITICAL: Raw JSON only — no markdown, no explanation outside the array.
 """
