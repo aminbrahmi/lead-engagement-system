@@ -127,8 +127,12 @@ class EmailFinderTool(BaseTool):
         # ── SMTP verify all candidates (highest confidence first) ─────────────
         clean.sort(key=lambda x: x["confidence"], reverse=True)
 
-        print(f"[EmailFinder] SMTP verifying {len(clean)} candidates…")
+        # Only SMTP-verify top 5 by confidence — patterns are low priority
+        to_verify = clean[:5]
+        print(f"[EmailFinder] SMTP verifying {len(to_verify)}/{len(clean)} candidates…")
         for c in clean:
+            c["verified"] = False   # default
+        for c in to_verify:
             verified = self._smtp_verify(c["email"])
             c["verified"] = verified
             status = "✅ verified" if verified else "⚠ unverified"
@@ -201,7 +205,7 @@ class EmailFinderTool(BaseTool):
                          "Content-Type": "application/json"},
                 json={"name": first, "surname": last,
                       "domain": domain, "enrich": True},
-                timeout=20,
+                timeout=30,
             )
             if resp.status_code == 200:
                 data = resp.json().get("data", {})
@@ -230,7 +234,7 @@ class EmailFinderTool(BaseTool):
                 "https://api.hunter.io/v2/email-finder",
                 params={"domain": domain, "first_name": first,
                         "last_name": last, "api_key": api_key},
-                timeout=20,
+                timeout=30,
             )
             data  = resp.json()
             email = data.get("data", {}).get("email")
@@ -254,7 +258,7 @@ class EmailFinderTool(BaseTool):
                 headers={"X-Api-Key": key},
                 json={"first_name": parts[0], "last_name": parts[-1],
                       "domain": domain},
-                timeout=20,
+                timeout=30,
             )
             return resp.json().get("person", {}).get("email")
         except Exception:
@@ -278,7 +282,7 @@ class EmailFinderTool(BaseTool):
                 resp    = session.post(
                     "https://api.tavily.com/search",
                     json={"api_key": key, "query": q, "max_results": 7},
-                    timeout=15,
+                    timeout=20,
                 )
                 content = " ".join(r.get("content", "")
                                    for r in resp.json().get("results", []))

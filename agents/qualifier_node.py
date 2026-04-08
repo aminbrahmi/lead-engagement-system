@@ -13,37 +13,14 @@ from agents.llm_factory import get_qualifier_llm
 from tools.name_enricher import NameEnricherTool
 from tools.email_finder  import EmailFinderTool
 from orchestration.prompts import QUALIFIER_SYSTEM
+from utils.json_utils import extract_json_list, detect_truncation
 
 
 _name_enricher = NameEnricherTool()
 _email_finder  = EmailFinderTool()
 
 
-def _extract_json_list(text: str) -> list:
-    if not text:
-        return []
-    # Try direct parse first
-    try:
-        data = json.loads(text.strip())
-        if isinstance(data, list):
-            return data
-    except Exception:
-        pass
-    # Extract first [...] block
-    match = re.search(r'\[.*\]', str(text), re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except Exception:
-            pass
-    return []
-
-
 def _resolve_company_domain(company: str) -> str:
-    """
-    DNS-based company domain resolution.
-    NEVER uses source_url — that's a news article, not the company site.
-    """
     slug = re.sub(r'[^a-z0-9]', '', company.lower().split()[0]) if company else ""
     if not slug:
         return f"{company.lower().replace(' ','')}.com"
@@ -54,7 +31,7 @@ def _resolve_company_domain(company: str) -> str:
             return domain
         except OSError:
             continue
-    return slug + ".com"   # best guess
+    return slug + ".com"
 
 
 # ── Step 1: parallel name enrichment ─────────────────────────────────────────
@@ -94,25 +71,20 @@ def _enrich_names_parallel(leads: list, max_workers: int = 6) -> list:
 def _find_email(lead: dict) -> dict:
     name    = lead.get("name", "")
     company = lead.get("company", "")
-
     if not name or name.lower() == "unknown":
         return lead
-
-    # ALWAYS resolve domain from company name via DNS — never from source_url
     domain = _resolve_company_domain(company)
-
-    query = f"{name} | {domain} | {company}"
+    query  = f"{name} | {domain} | {company}"
     try:
         raw  = _email_finder._run(query)
         data = json.loads(raw)
-        email  = data.get("email")
-        source = data.get("source")
+        email = data.get("email")
         if email:
             lead = dict(lead)
             lead["email"]        = email
-            lead["email_source"] = source
+            lead["email_source"] = data.get("source")
             lead["email_conf"]   = data.get("confidence", 0)
-            print(f"[Qualifier] ✓ Email found: {email} ({source}) @ {company}")
+            print(f"[Qualifier] ✓ Email found: {email} ({data.get('source')}) @ {company}")
     except Exception as exc:
         print(f"[Qualifier] Email finding failed for {company}: {exc}")
     return lead
@@ -134,67 +106,70 @@ def _find_emails_parallel(leads: list, max_workers: int = 6) -> list:
 
 # ── Step 3: single LLM scoring call ──────────────────────────────────────────
 
-def _scoring_prompt(campaign_prompt: str, leads: list) -> str:
-    leads_json = json.dumps(leads, indent=2, ensure_ascii=False)
-    return f"""Campaign brief: "{campaign_prompt}"
+def _compact_lead(lead: dict) -> dict:
+    """Strip large fields before sending to scoring LLM to stay under TPM."""
+    return {
+        "name":         lead.get("name", "unknown"),
+        "company":      lead.get("company", ""),
+        "role":         lead.get("role", ""),
+        "location":     lead.get("location", ""),
+        "email":        lead.get("email"),
+        "email_source": lead.get("email_source"),
+        "notes":        (lead.get("notes") or "")[:120],  # trim long notes
+    }
 
-Pre-enriched leads (names and emails already resolved):
+
+def _scoring_prompt(campaign_prompt: str, leads: list) -> str:
+    compact = [_compact_lead(l) for l in leads]
+    leads_json = json.dumps(compact, ensure_ascii=False)
+    return f"""Campaign: "{campaign_prompt}"
+
+Leads:
 {leads_json}
 
-Score ALL {len(leads)} leads. Return a JSON array with exactly {len(leads)} objects.
+Score each lead 0-99. Criteria: role match(0-30), location(0-20), company fit(0-20), funding(0-20), data quality(0-10).
+Unverified/pattern email → max 72, segment=warm. No email → max 40, segment=cold.
+Verified email (findthatlead/hunter/apollo/smtp) + score>=75 → hot.
+Score 45-74 → warm. Score<45 → cold.
 
-Scoring (0-100, NEVER 100, NEVER give everyone the same score):
-  ROLE MATCH    (0-30): exact title match=30, similar title=20, unrelated=0
-  LOCATION      (0-20): exact city=20, same country=10, different country=0
-  COMPANY FIT   (0-20): right industry+type=20, industry only=12, type only=8, neither=0
-  FUNDING       (0-20): funding confirmed within requested period=20, funding exists but period unclear=10, no funding info=0
-  DATA QUALITY  (0-10): SMTP-verified email=10, unverified pattern email=4, no email=1, no name=0
+Return ONLY JSON array:
+[{{"name":"...","company":"...","role":"...","location":"...","source_url":"...","email":"...","email_source":"...","score":N,"segment":"hot|warm|cold","reason":"short","keep":true/false}}]"""
 
-STRICT CALIBRATION — apply these ceilings or scores are wrong:
-  - Pattern email (unverified): max score = 75, deduct 6 pts from data quality
-  - No funding date found: deduct 10 pts from funding score
-  - Name was unknown (enriched): deduct 3 pts from data quality
-  - Perfect match all criteria = 85-92 (never above 95)
-  - Strong match with unverified email = 65-75
-  - Good match but missing funding proof = 50-65
-  - Scores must VARY across leads — if all leads score the same you are wrong
 
-Segments:
-  score >= 75 AND email is SMTP-verified → segment="hot",  keep=true
-  score >= 75 AND email is unverified pattern → segment="warm", keep=true
-  score 45-74 → segment="warm", keep=true
-  score < 45  → segment="cold", keep=false
+def _default_score_leads(leads: list) -> list:
+    """
+    When scoring LLM fails, assign default scores based on available data.
+    Preserves names and emails already found.
+    """
+    scored = []
+    for lead in leads:
+        lead = dict(lead)
+        has_email    = bool(lead.get("email"))
+        email_source = lead.get("email_source", "")
+        verified     = email_source in ("findthatlead", "hunter", "apollo", "smtp")
 
-CRITICAL email trust rules:
-  - email_source="findthatlead" or "hunter" or "apollo" or "smtp" → treat as verified
-  - email_source="pattern" or "google" or "scraping" → treat as unverified
-  - Unverified email: hard cap score at 72, segment="warm"
-  - No email at all: hard cap score at 40, segment="cold", keep=false
+        if not has_email:
+            lead["score"]   = 30
+            lead["segment"] = "cold"
+            lead["keep"]    = False
+        elif verified:
+            lead["score"]   = 75
+            lead["segment"] = "hot"
+            lead["keep"]    = True
+        else:
+            lead["score"]   = 55
+            lead["segment"] = "warm"
+            lead["keep"]    = True
 
-Return ONLY a raw JSON array — no markdown, no explanation, no text outside the array:
-[
-  {{
-    "name": "...",
-    "company": "...",
-    "role": "...",
-    "location": "...",
-    "source_url": "...",
-    "email": null or "...",
-    "email_source": null or "...",
-    "score": 0-99,
-    "segment": "hot|warm|cold",
-    "reason": "2-3 sentences covering each scoring category",
-    "keep": true or false
-  }}
-]
-
-CRITICAL: Output the JSON array only. No preamble, no explanation."""
+        lead["reason"] = "Default score — LLM scoring was unavailable."
+        scored.append(lead)
+    return scored
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def run_qualifier(campaign_prompt: str, raw_leads_json: str) -> str:
-    raw_leads = _extract_json_list(raw_leads_json)
+    raw_leads = extract_json_list(raw_leads_json, context="Qualifier input")
     if not raw_leads:
         print("[Qualifier] No leads to qualify.")
         return "[]"
@@ -203,12 +178,6 @@ def run_qualifier(campaign_prompt: str, raw_leads_json: str) -> str:
 
     leads = _enrich_names_parallel(raw_leads)
     leads = _find_emails_parallel(leads)
-
-    llm      = get_qualifier_llm()
-    messages = [
-        SystemMessage(content=QUALIFIER_SYSTEM),
-        HumanMessage(content=_scoring_prompt(campaign_prompt, leads)),
-    ]
 
     # ── Pre-filter: auto-reject leads with no name or no email ──────────────
     scoreable = []
@@ -232,35 +201,48 @@ def run_qualifier(campaign_prompt: str, raw_leads_json: str) -> str:
         print("[Qualifier] No scoreable leads after filtering.")
         return json.dumps(rejected)
 
-    # Re-build prompt with only scoreable leads
-    messages = [
-        SystemMessage(content=QUALIFIER_SYSTEM),
-        HumanMessage(content=_scoring_prompt(campaign_prompt, scoreable)),
-    ]
+    # ── LLM scoring with fallback ────────────────────────────────────────────
+    try:
+        messages = [
+            SystemMessage(content=QUALIFIER_SYSTEM),
+            HumanMessage(content=_scoring_prompt(campaign_prompt, scoreable)),
+        ]
 
-    print(f"[Qualifier] Calling LLM for scoring ({len(scoreable)} leads)…")
-    response = llm.invoke(messages)
+        print(f"[Qualifier] Calling LLM for scoring ({len(scoreable)} leads)…")
+        response = get_qualifier_llm().invoke(messages)
 
-    content = response.content
-    if isinstance(content, list):
-        content = "\n".join(
-            b["text"] for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        )
+        content = response.content
+        if isinstance(content, list):
+            content = "\n".join(
+                b["text"] for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
 
-    # Debug — show first 300 chars of LLM response
-    preview = (content or "")[:300].replace("\n", " ")
-    print(f"[Qualifier] LLM raw response preview: {preview}")
+        if detect_truncation(content or "", context="Qualifier LLM scoring"):
+            print("[Qualifier] ⚠ LLM response was truncated — will attempt partial recovery.")
 
-    # If LLM wrapped in markdown fences, strip them
-    content = re.sub(r'```json|```', '', content or '').strip()
+        preview = (content or "")[:300].replace("\n", " ")
+        print(f"[Qualifier] LLM raw response preview: {preview}")
 
-    parsed = _extract_json_list(content)
-    if not parsed:
-        print("[Qualifier] ⚠ Could not parse LLM response as JSON array.")
-        print(f"[Qualifier] Full response:\n{content[:1000]}")
-        parsed = []
+        parsed = extract_json_list(content or "", context="Qualifier scoring output")
 
-    # Merge auto-rejected leads back in so storage sees them all
-    all_leads = parsed + rejected
+        if parsed:
+            print(f"[Qualifier] ✓ Parsed {len(parsed)}/{len(scoreable)} scored leads")
+            # Merge source_url back from scoreable (stripped in compact)
+            company_urls = {l["company"]: l.get("source_url", "") for l in scoreable}
+            for p in parsed:
+                if not p.get("source_url"):
+                    p["source_url"] = company_urls.get(p.get("company"), "")
+            all_leads = parsed + rejected
+            return json.dumps(all_leads)
+
+        print("[Qualifier] ⚠ Could not parse LLM response — using default scores.")
+
+    except Exception as exc:
+        print(f"[Qualifier] ⚠ Scoring LLM failed: {exc}")
+        print("[Qualifier] FALLBACK → Assigning default scores (names + emails preserved).")
+
+    # Fallback: default scoring — keeps all enriched data
+    scored = _default_score_leads(scoreable)
+    all_leads = scored + rejected
     return json.dumps(all_leads)

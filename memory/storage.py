@@ -32,6 +32,8 @@ def init_db():
             score        INTEGER DEFAULT 0,
             segment      TEXT DEFAULT 'unknown',
             reason       TEXT,
+            insights     TEXT,
+            draft_email  TEXT,
             created_at   TEXT,
             updated_at   TEXT
         )
@@ -48,15 +50,6 @@ def init_db():
     conn.close()
 
 def _generate_id(name: str, company: str) -> str:
-    """
-    Stable ID keyed on company name only.
-
-    ROOT CAUSE FIX for "Updated 0 leads":
-    Agent 1 saves leads with name="unknown", company="Parloa" → id = md5("parloa").
-    Agent 2 returns name="Maximilian Gross", company="Parloa".
-    Old code: id = md5("maximilian gross_parloa") ≠ md5("unknown_parloa") → 0 matches.
-    New code: id = md5("parloa") in both cases → always matches.
-    """
     raw = company.lower().strip()
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
@@ -81,7 +74,6 @@ def save_leads(leads: list, campaign_prompt: str) -> dict:
     added      = 0
     duplicates = 0
 
-    # ── Filter invalid leads ──
     valid_leads   = [l for l in leads if _is_valid_lead(l)]
     invalid_count = len(leads) - len(valid_leads)
     if invalid_count > 0:
@@ -207,7 +199,7 @@ def save_leads(leads: list, campaign_prompt: str) -> dict:
                     }]
                 )
             except Exception:
-                pass  # duplicate in Chroma — expected, ignore silently
+                pass
     except Exception as e:
         print(f"[Storage] ChromaDB warning: {e}")
 
@@ -258,11 +250,6 @@ def is_duplicate(name: str, company: str) -> bool:
 
 
 def update_lead_qualification(qualified_leads: list) -> int:
-    """
-    Update score, segment, email for each qualified lead.
-    Uses company-only ID — immune to name changes between Agent 1 and Agent 2.
-    Also writes the resolved name back (was 'unknown' at collection time).
-    """
     init_db()
     conn   = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -307,7 +294,6 @@ def update_lead_qualification(qualified_leads: list) -> int:
             print(f"[Storage] ✓ Qualified: {lead.get('company')} → {segment} (score={score})")
         else:
             print(f"[Storage] ⚠ No row found for: {lead.get('company')} (id={lead_id})")
-            print(f"           Tip: does this company exist in leads.db from Agent 1?")
 
     conn.commit()
     conn.close()
@@ -326,7 +312,6 @@ def _sync_json_with_qualification(qualified_leads: list):
     except Exception:
         return
 
-    # Index by company-based ID — consistent with _generate_id
     qual_index = {
         _generate_id(l.get("name", "unknown"), l.get("company", "unknown")): l
         for l in qualified_leads
@@ -354,6 +339,124 @@ def _sync_json_with_qualification(qualified_leads: list):
         json.dump(existing, f, indent=2, ensure_ascii=False)
     print(f"[Storage] JSON synced: {updated_count} leads updated")
 
+
+# ── NEW: Save enrichment results (insights + draft emails) ───────────────────
+
+def save_enrichment_results(enriched_leads: list) -> int:
+    """
+    Persist insights and draft_email for each lead to both SQLite and JSON.
+    Called after Agent 3 (enricher) and/or Agent 4 (email writer).
+    """
+    init_db()
+
+    # Ensure columns exist (safe for repeated calls)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        for col in ["insights", "draft_email", "insights_quality"]:
+            try:
+                cursor.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT")
+            except Exception:
+                pass  # column already exists
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+    conn   = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    now    = datetime.now().isoformat()
+
+    updated = 0
+    for lead in enriched_leads:
+        lead_id = _generate_id(
+            lead.get("name", "unknown"),
+            lead.get("company", "unknown")
+        )
+
+        insights_json    = json.dumps(lead.get("insights", {}), ensure_ascii=False) \
+                           if lead.get("insights") else None
+        draft_email_json = json.dumps(lead.get("draft_email", {}), ensure_ascii=False) \
+                           if lead.get("draft_email") else None
+        insights_quality = lead.get("insights_quality")
+
+        cursor.execute("""
+            UPDATE leads
+            SET insights         = ?,
+                draft_email      = ?,
+                insights_quality = ?,
+                status           = ?,
+                updated_at       = ?
+            WHERE id = ?
+        """, (
+            insights_json,
+            draft_email_json,
+            insights_quality,
+            "enriched" if draft_email_json else "qualified",
+            now,
+            lead_id,
+        ))
+
+        if cursor.rowcount > 0:
+            updated += 1
+            has_email = "✉" if draft_email_json else "—"
+            has_ins   = "✓" if insights_json else "—"
+            print(f"[Storage] ✓ Enrichment saved: {lead.get('company')} "
+                  f"[insights={has_ins} email={has_email}]")
+        else:
+            print(f"[Storage] ⚠ No row found for enrichment: {lead.get('company')} (id={lead_id})")
+
+    conn.commit()
+    conn.close()
+
+    # ── Sync to JSON ──
+    _sync_json_with_enrichment(enriched_leads)
+
+    print(f"[Storage] Enrichment persistence done: {updated}/{len(enriched_leads)} leads updated")
+    return updated
+
+
+def _sync_json_with_enrichment(enriched_leads: list):
+    """Merge insights + draft_email into leads_raw.json."""
+    if not os.path.exists(JSON_PATH):
+        return
+    try:
+        with open(JSON_PATH, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except Exception:
+        return
+
+    enrich_index = {
+        _generate_id(l.get("name", "unknown"), l.get("company", "unknown")): l
+        for l in enriched_leads
+    }
+
+    updated_count = 0
+    for entry in existing:
+        entry_id = _generate_id(
+            entry.get("name", "unknown"),
+            entry.get("company", "unknown")
+        )
+        if entry_id in enrich_index:
+            src = enrich_index[entry_id]
+
+            if src.get("insights"):
+                entry["insights"] = src["insights"]
+                entry["insights_quality"] = src.get("insights_quality")
+
+            if src.get("draft_email"):
+                entry["draft_email"] = src["draft_email"]
+                entry["status"]      = "enriched"
+
+            entry["enriched_at"] = datetime.now().isoformat()
+            updated_count += 1
+
+    with open(JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+    print(f"[Storage] JSON enrichment synced: {updated_count} leads updated")
+
+
+# ── Existing helpers ──────────────────────────────────────────────────────────
 
 def update_email_in_db(name: str, company: str, email: str, source: str):
     init_db()

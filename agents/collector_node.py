@@ -1,10 +1,5 @@
 """
 collector_node.py — fast path: parallel Tavily searches → single LLM extraction.
-
-Replaces the ReAct agent loop (5 sequential search + LLM round-trips)
-with a ThreadPoolExecutor burst (all searches fire at once) followed by
-a single LLM call that extracts leads from the combined results.
-Typical time: ~8-15 s instead of ~90 s.
 """
 
 import json
@@ -16,12 +11,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.llm_factory import get_collector_llm
 from orchestration.prompts import COLLECTOR_SYSTEM
+from utils.json_utils import detect_truncation
 
 
 # ── Tavily parallel search ────────────────────────────────────────────────────
 
 def _tavily_search(query: str, api_key: str, max_results: int = 5) -> list[dict]:
-    """Single Tavily call — returns list of {title, url, content}."""
     try:
         resp = requests.post(
             "https://api.tavily.com/search",
@@ -40,7 +35,6 @@ def _tavily_search(query: str, api_key: str, max_results: int = 5) -> list[dict]
 
 
 def _run_parallel_searches(queries: list[str], max_workers: int = 5) -> str:
-    """Fire all queries concurrently, return combined text blob."""
     api_key = __import__("os").getenv("TAVILY_API_KEY", "")
     results_by_query: dict[str, list] = {}
 
@@ -54,7 +48,6 @@ def _run_parallel_searches(queries: list[str], max_workers: int = 5) -> str:
             results_by_query[q] = results
             print(f"[Collector] ✓ Search done ({len(results)} results): {q[:60]}")
 
-    # Flatten into a text blob the LLM can parse
     lines: list[str] = []
     for query, results in results_by_query.items():
         lines.append(f"\n### Search: {query}")
@@ -106,20 +99,39 @@ def run_collector(campaign_prompt: str, criteria: dict) -> str:
 
     search_blob = _run_parallel_searches(queries)
 
+    if len(search_blob.strip()) < 100:
+        print(f"[Collector] ⚠ Very little search content ({len(search_blob)} chars)")
+
     llm = get_collector_llm()
     messages = [
         SystemMessage(content=COLLECTOR_SYSTEM),
         HumanMessage(content=_extraction_prompt(campaign_prompt, criteria, search_blob)),
     ]
 
-    print("[Collector] Calling LLM for extraction…")
-    response = llm.invoke(messages)
+    # Try up to 2 times — LLMs sometimes return empty or malformed on first try
+    for attempt in range(1, 3):
+        print(f"[Collector] Calling LLM for extraction (attempt {attempt})…")
+        response = llm.invoke(messages)
 
-    # Handle both str and list-of-blocks content (Anthropic / Ollama)
-    content = response.content
-    if isinstance(content, list):
-        content = "\n".join(
-            b["text"] for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        )
+        content = response.content
+        if isinstance(content, list):
+            content = "\n".join(
+                b["text"] for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+
+        # Debug: show what came back
+        preview = (content or "")[:300].replace("\n", " ")
+        print(f"[Collector] LLM response preview: {preview}")
+
+        if detect_truncation(content or "", context="Collector LLM extraction"):
+            print("[Collector] ⚠ Response may be incomplete — attempting recovery.")
+
+        # Quick check: does it contain a JSON array?
+        if content and ("[" in content):
+            return content
+
+        print(f"[Collector] ⚠ No JSON array found in response (attempt {attempt})")
+
+    # Return whatever we got — downstream will handle parse failure
     return content or ""

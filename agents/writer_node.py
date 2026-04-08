@@ -1,5 +1,5 @@
 """
-email_generator_node.py — generate a personalized cold email for each lead.
+writer_node.py — generate a personalized cold email for each lead.
 
 Uses the structured insights from enricher_node to write emails that:
   - Open with a specific, real reference (not "I came across your profile")
