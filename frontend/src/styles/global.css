@@ -1,0 +1,56 @@
+/* src/styles/global.css */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #3a3a4f; border-radius: 3px; }
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-12px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Utility classes */
+.fade-in { animation: fadeIn 0.4s ease both; }
+.slide-in { animation: slideIn 0.35s ease both; }
+
+/* Focus styles */
+input:focus, textarea:focus {
+  outline: none;
+}
+
+/* Selection */
+::selection {
+  background: rgba(108,92,231,0.3);
+}
+
+/* Smooth transitions for theme changes */
+header, main, div, span, p, h1, h2, h3, h4, button, input, textarea, table, td, th, tr {
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+}

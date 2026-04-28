@@ -22,27 +22,6 @@ def _make_llm(provider: str, model_name: str, max_tokens: int = 8192) -> BaseCha
     raise ValueError(f"Unknown provider: {provider}")
 
 
-# ── Benchmark results (April 2026) ───────────────────────────────────────────
-#
-#   Parser:    gpt-oss-120b=100  llama-70b=80   gpt-oss-20b=100
-#   Collector: gpt-oss-120b=100  llama-70b=100  gpt-oss-20b=0
-#   Qualifier: llama-70b=87      gpt-oss-120b=80
-#   Enricher:  gpt-oss-120b=100  gpt-oss-20b=100  llama-70b=92
-#   Writer:    llama-70b=100     gpt-oss-20b=100  gpt-oss-120b=97
-#
-# TPM limits (Groq free tier):
-#   gpt-oss-120b: 8K TPM   ← bottleneck
-#   llama-3.3-70b: 30K TPM ← safe for heavy use
-#   gpt-oss-20b: 30K TPM   ← safe but weakest
-#
-# Strategy: spread gpt-oss-120b across non-overlapping stages.
-#   Parser (runs first, small) → gpt-oss-120b  ✓ best quality
-#   Collector (runs second, large) → llama-70b  ✓ tied score, avoids TPM clash
-#   Qualifier (runs third) → llama-70b          ✓ benchmark winner
-#   Enricher (runs later, TPM refreshed) → gpt-oss-120b  ✓ best quality
-#   Writer (many concurrent) → llama-70b        ✓ benchmark winner, high TPM
-
-
 def get_collector_llm() -> BaseChatModel:
     """Benchmark: llama=100, gpt-oss-120b=100. Using llama to avoid TPM clash with parser."""
     models = [

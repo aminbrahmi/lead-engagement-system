@@ -1,57 +1,176 @@
-# memory/storage.py
-import sqlite3
+# memory/storage.py — PostgreSQL version
 import json
 import os
 import hashlib
 from datetime import datetime
+from contextlib import contextmanager
+
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set")
 
 DATA_DIR  = os.path.join(os.path.dirname(__file__), "..", "data")
-DB_PATH   = os.path.join(DATA_DIR, "leads.db")
 JSON_PATH = os.path.join(DATA_DIR, "leads_raw.json")
+
+# ── Connection pool ───────────────────────────────────────────────────────────
+
+_pool = None
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        _pool = pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            dsn=DATABASE_URL,
+        )
+    return _pool
+
+
+@contextmanager
+def get_conn():
+    """Get a connection from the pool, auto-commit on success, rollback on error."""
+    p = _get_pool()
+    conn = p.getconn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        p.putconn(conn)
+
 
 def _ensure_dirs():
     os.makedirs(DATA_DIR, exist_ok=True)
 
+
+# ── Schema ────────────────────────────────────────────────────────────────────
+
 def init_db():
     _ensure_dirs()
-    conn   = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS leads (
-            id           TEXT PRIMARY KEY,
-            name         TEXT,
-            company      TEXT,
-            role         TEXT,
-            location     TEXT,
-            source_url   TEXT,
-            notes        TEXT,
-            email        TEXT,
-            email_source TEXT,
-            campaign     TEXT,
-            status       TEXT DEFAULT 'collected',
-            score        INTEGER DEFAULT 0,
-            segment      TEXT DEFAULT 'unknown',
-            reason       TEXT,
-            insights     TEXT,
-            draft_email  TEXT,
-            created_at   TEXT,
-            updated_at   TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS campaigns (
-            id          TEXT PRIMARY KEY,
-            prompt      TEXT,
-            leads_count INTEGER,
-            created_at  TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id               VARCHAR(12) PRIMARY KEY,
+                name             TEXT,
+                company          TEXT,
+                role             TEXT,
+                location         TEXT,
+                source_url       TEXT,
+                notes            TEXT,
+                email            TEXT,
+                email_source     TEXT,
+                email_verified   BOOLEAN DEFAULT FALSE,
+                campaign         VARCHAR(12),
+                status           VARCHAR(20) DEFAULT 'collected',
+                score            INTEGER DEFAULT 0,
+                segment          VARCHAR(10) DEFAULT 'unknown',
+                reason           TEXT,
+                insights         TEXT,
+                draft_email      TEXT,
+                draft_emails     TEXT,
+                insights_quality VARCHAR(10),
+                created_at       TIMESTAMPTZ,
+                updated_at       TIMESTAMPTZ
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS campaigns (
+                id          VARCHAR(12) PRIMARY KEY,
+                prompt      TEXT,
+                criteria    TEXT,
+                status      VARCHAR(20) DEFAULT 'pending',
+                leads_count INTEGER DEFAULT 0,
+                created_at  TIMESTAMPTZ,
+                updated_at  TIMESTAMPTZ
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS campaign_events (
+                id          SERIAL PRIMARY KEY,
+                campaign_id VARCHAR(12) REFERENCES campaigns(id),
+                agent       VARCHAR(30),
+                event_type  VARCHAR(30),
+                message     TEXT,
+                metadata    TEXT,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS exclusion_list (
+                id         SERIAL PRIMARY KEY,
+                value      TEXT NOT NULL,
+                type       VARCHAR(20) NOT NULL,
+                reason     TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sender_config (
+                id         SERIAL PRIMARY KEY,
+                name       TEXT NOT NULL,
+                email      TEXT NOT NULL,
+                title      TEXT,
+                company    TEXT,
+                signature  TEXT,
+                is_default BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS email_sequences (
+                id            SERIAL PRIMARY KEY,
+                lead_id       VARCHAR(12) REFERENCES leads(id),
+                campaign_id   VARCHAR(12) REFERENCES campaigns(id),
+                step          INTEGER NOT NULL,
+                variant       VARCHAR(10),
+                subject       TEXT NOT NULL,
+                body          TEXT NOT NULL,
+                cc            TEXT,
+                status        VARCHAR(20) DEFAULT 'scheduled',
+                scheduled_for TIMESTAMPTZ NOT NULL,
+                sent_at       TIMESTAMPTZ,
+                message_id    TEXT,
+                error_message TEXT,
+                created_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        # Indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_leads_campaign ON leads(campaign)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_leads_segment ON leads(segment)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_campaign ON campaign_events(campaign_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_exclusion_type ON exclusion_list(type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sequences_lead ON email_sequences(lead_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sequences_status ON email_sequences(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sequences_scheduled ON email_sequences(scheduled_for)")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _generate_id(name: str, company: str) -> str:
     raw = company.lower().strip()
     return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def _generate_campaign_id(prompt: str) -> str:
+    """Same prompt always produces the same campaign ID."""
+    normalized = prompt.strip().lower()
+    return hashlib.md5(normalized.encode()).hexdigest()[:12]
+
 
 def _is_valid_lead(lead: dict) -> bool:
     url = lead.get("source_url", "")
@@ -62,17 +181,53 @@ def _is_valid_lead(lead: dict) -> bool:
         return False
     return True
 
+
+# ── Campaign queries ──────────────────────────────────────────────────────────
+
+def get_campaign_by_prompt(prompt: str) -> dict | None:
+    """Check if a campaign with this prompt already exists."""
+    campaign_id = _generate_campaign_id(prompt)
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM campaigns WHERE id = %s", (campaign_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_all_campaigns() -> list:
+    """Return all campaigns with lead count breakdown."""
+    init_db()
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT
+                c.id,
+                c.prompt,
+                c.created_at,
+                c.updated_at,
+                COUNT(l.id) AS leads_count,
+                COUNT(CASE WHEN l.segment = 'hot' THEN 1 END)  AS hot_count,
+                COUNT(CASE WHEN l.segment = 'warm' THEN 1 END) AS warm_count,
+                COUNT(CASE WHEN l.segment = 'cold' THEN 1 END) AS cold_count,
+                COUNT(CASE WHEN l.draft_email IS NOT NULL THEN 1 END) AS emails_count
+            FROM campaigns c
+            LEFT JOIN leads l ON l.campaign = c.id
+            GROUP BY c.id
+            ORDER BY COALESCE(c.updated_at, c.created_at) DESC
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+
+
+# ── Save leads (Agent 1 output) ──────────────────────────────────────────────
+
 def save_leads(leads: list, campaign_prompt: str) -> dict:
     _ensure_dirs()
     init_db()
 
-    campaign_id = hashlib.md5(
-        f"{campaign_prompt}{datetime.now().isoformat()}".encode()
-    ).hexdigest()[:8]
-
-    now        = datetime.now().isoformat()
-    added      = 0
-    duplicates = 0
+    campaign_id = _generate_campaign_id(campaign_prompt)
+    now         = datetime.now().isoformat()
+    added       = 0
+    duplicates  = 0
 
     valid_leads   = [l for l in leads if _is_valid_lead(l)]
     invalid_count = len(leads) - len(valid_leads)
@@ -86,57 +241,61 @@ def save_leads(leads: list, campaign_prompt: str) -> dict:
         print("[Storage] ⚠ No valid leads to save — check source_url values in agent output")
         return {"campaign_id": campaign_id, "added": 0, "duplicates": 0, "total": 0}
 
-    # ── 1. SQLite ──
+    # ── 1. PostgreSQL ──
     try:
-        conn   = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        with get_conn() as conn:
+            cursor = conn.cursor()
 
-        for lead in leads:
-            lead_id = _generate_id(
-                lead.get("name", "unknown"),
-                lead.get("company", "unknown")
-            )
-            cursor.execute("SELECT id FROM leads WHERE id = ?", (lead_id,))
-            existing = cursor.fetchone()
-
-            if existing:
-                cursor.execute(
-                    "UPDATE leads SET updated_at = ? WHERE id = ?",
-                    (now, lead_id)
-                )
-                duplicates += 1
-                print(f"[Storage] Duplicate skipped: {lead.get('company')}")
-            else:
-                cursor.execute("""
-                    INSERT INTO leads
-                    (id, name, company, role, location, source_url, notes,
-                     campaign, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'collected', ?, ?)
-                """, (
-                    lead_id,
+            for lead in leads:
+                lead_id = _generate_id(
                     lead.get("name", "unknown"),
-                    lead.get("company", "unknown"),
-                    lead.get("role", ""),
-                    lead.get("location", ""),
-                    lead.get("source_url", ""),
-                    lead.get("notes", ""),
-                    campaign_id,
-                    now, now
-                ))
-                added += 1
-                print(f"[Storage] ✓ Inserted: {lead.get('company')} / {lead.get('name')}")
+                    lead.get("company", "unknown")
+                )
+                cursor.execute("SELECT id FROM leads WHERE id = %s", (lead_id,))
+                existing = cursor.fetchone()
 
-        cursor.execute("""
-            INSERT OR IGNORE INTO campaigns (id, prompt, leads_count, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (campaign_id, campaign_prompt, added, now))
+                if existing:
+                    cursor.execute(
+                        "UPDATE leads SET updated_at = %s, campaign = %s WHERE id = %s",
+                        (now, campaign_id, lead_id)
+                    )
+                    duplicates += 1
+                    print(f"[Storage] Duplicate updated: {lead.get('company')}")
+                else:
+                    cursor.execute("""
+                        INSERT INTO leads
+                        (id, name, company, role, location, source_url, notes,
+                         campaign, status, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'collected', %s, %s)
+                    """, (
+                        lead_id,
+                        lead.get("name", "unknown"),
+                        lead.get("company", "unknown"),
+                        lead.get("role", ""),
+                        lead.get("location", ""),
+                        lead.get("source_url", ""),
+                        lead.get("notes", ""),
+                        campaign_id,
+                        now, now
+                    ))
+                    added += 1
+                    print(f"[Storage] ✓ Inserted: {lead.get('company')} / {lead.get('name')}")
 
-        conn.commit()
-        conn.close()
-        print(f"[Storage] SQLite: {added} inserted, {duplicates} duplicates")
+            # Upsert campaign — create if new, update if exists
+            cursor.execute("""
+                INSERT INTO campaigns (id, prompt, leads_count, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    leads_count = (
+                        SELECT COUNT(*) FROM leads WHERE campaign = %s
+                    ),
+                    updated_at = %s
+            """, (campaign_id, campaign_prompt, added, now, now, campaign_id, now))
+
+            print(f"[Storage] PostgreSQL: {added} inserted, {duplicates} duplicates")
 
     except Exception as e:
-        print(f"[Storage] ❌ SQLite error: {e}")
+        print(f"[Storage] ❌ PostgreSQL error: {e}")
         import traceback; traceback.print_exc()
 
     # ── 2. JSON (with dedup) ──
@@ -213,90 +372,84 @@ def save_leads(leads: list, campaign_prompt: str) -> dict:
     return summary
 
 
+# ── Read queries ──────────────────────────────────────────────────────────────
+
 def get_all_leads(status: str = None) -> list:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    if status:
-        cursor.execute("SELECT * FROM leads WHERE status = ?", (status,))
-    else:
-        cursor.execute("SELECT * FROM leads ORDER BY created_at DESC")
-    leads = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return leads
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        if status:
+            cursor.execute("SELECT * FROM leads WHERE status = %s", (status,))
+        else:
+            cursor.execute("SELECT * FROM leads ORDER BY created_at DESC")
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def get_campaign_leads(campaign_id: str) -> list:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM leads WHERE campaign = ?", (campaign_id,))
-    leads = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return leads
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM leads WHERE campaign = %s ORDER BY score DESC", (campaign_id,))
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def is_duplicate(name: str, company: str) -> bool:
     init_db()
     lead_id = _generate_id(name, company)
-    conn    = sqlite3.connect(DB_PATH)
-    cursor  = conn.cursor()
-    cursor.execute("SELECT id FROM leads WHERE id = ?", (lead_id,))
-    exists = cursor.fetchone() is not None
-    conn.close()
-    return exists
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM leads WHERE id = %s", (lead_id,))
+        return cursor.fetchone() is not None
 
+
+# ── Update qualification (Agent 2 output) ─────────────────────────────────────
 
 def update_lead_qualification(qualified_leads: list) -> int:
     init_db()
-    conn   = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    now    = datetime.now().isoformat()
-
+    now = datetime.now().isoformat()
     updated = 0
-    for lead in qualified_leads:
-        lead_id = _generate_id(
-            lead.get("name", "unknown"),
-            lead.get("company", "unknown")
-        )
-        score   = lead.get("score", 0)
-        segment = lead.get("segment", "cold")
-        keep    = lead.get("keep", False)
-        status  = "qualified" if keep else "rejected"
 
-        cursor.execute("""
-            UPDATE leads
-            SET name         = ?,
-                score        = ?,
-                segment      = ?,
-                status       = ?,
-                email        = ?,
-                email_source = ?,
-                reason       = ?,
-                updated_at   = ?
-            WHERE id = ?
-        """, (
-            lead.get("name"),
-            score,
-            segment,
-            status,
-            lead.get("email"),
-            lead.get("email_source"),
-            lead.get("reason"),
-            now,
-            lead_id
-        ))
+    with get_conn() as conn:
+        cursor = conn.cursor()
 
-        if cursor.rowcount > 0:
-            updated += 1
-            print(f"[Storage] ✓ Qualified: {lead.get('company')} → {segment} (score={score})")
-        else:
-            print(f"[Storage] ⚠ No row found for: {lead.get('company')} (id={lead_id})")
+        for lead in qualified_leads:
+            lead_id = _generate_id(
+                lead.get("name", "unknown"),
+                lead.get("company", "unknown")
+            )
+            score   = lead.get("score", 0)
+            segment = lead.get("segment", "cold")
+            keep    = lead.get("keep", False)
+            status  = "qualified" if keep else "rejected"
 
-    conn.commit()
-    conn.close()
+            cursor.execute("""
+                UPDATE leads
+                SET name         = %s,
+                    score        = %s,
+                    segment      = %s,
+                    status       = %s,
+                    email        = %s,
+                    email_source = %s,
+                    reason       = %s,
+                    updated_at   = %s
+                WHERE id = %s
+            """, (
+                lead.get("name"),
+                score,
+                segment,
+                status,
+                lead.get("email"),
+                lead.get("email_source"),
+                lead.get("reason"),
+                now,
+                lead_id
+            ))
+
+            if cursor.rowcount > 0:
+                updated += 1
+                print(f"[Storage] ✓ Qualified: {lead.get('company')} → {segment} (score={score})")
+            else:
+                print(f"[Storage] ⚠ No row found for: {lead.get('company')} (id={lead_id})")
 
     _sync_json_with_qualification(qualified_leads)
     print(f"[Storage] Qualification done: {updated}/{len(qualified_leads)} leads updated")
@@ -340,78 +493,63 @@ def _sync_json_with_qualification(qualified_leads: list):
     print(f"[Storage] JSON synced: {updated_count} leads updated")
 
 
-# ── NEW: Save enrichment results (insights + draft emails) ───────────────────
+# ── Save enrichment results (Agent 3 + 4 output) ─────────────────────────────
 
 def save_enrichment_results(enriched_leads: list) -> int:
-    """
-    Persist insights and draft_email for each lead to both SQLite and JSON.
-    Called after Agent 3 (enricher) and/or Agent 4 (email writer).
-    """
+    """Persist insights and draft_email for each lead to PostgreSQL and JSON."""
     init_db()
-
-    # Ensure columns exist (safe for repeated calls)
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        for col in ["insights", "draft_email", "insights_quality"]:
-            try:
-                cursor.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT")
-            except Exception:
-                pass  # column already exists
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
-
-    conn   = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    now    = datetime.now().isoformat()
-
+    now = datetime.now().isoformat()
     updated = 0
-    for lead in enriched_leads:
-        lead_id = _generate_id(
-            lead.get("name", "unknown"),
-            lead.get("company", "unknown")
-        )
 
-        insights_json    = json.dumps(lead.get("insights", {}), ensure_ascii=False) \
-                           if lead.get("insights") else None
-        draft_email_json = json.dumps(lead.get("draft_email", {}), ensure_ascii=False) \
-                           if lead.get("draft_email") else None
-        insights_quality = lead.get("insights_quality")
+    with get_conn() as conn:
+        cursor = conn.cursor()
 
-        cursor.execute("""
-            UPDATE leads
-            SET insights         = ?,
-                draft_email      = ?,
-                insights_quality = ?,
-                status           = ?,
-                updated_at       = ?
-            WHERE id = ?
-        """, (
-            insights_json,
-            draft_email_json,
-            insights_quality,
-            "enriched" if draft_email_json else "qualified",
-            now,
-            lead_id,
-        ))
+        for lead in enriched_leads:
+            lead_id = _generate_id(
+                lead.get("name", "unknown"),
+                lead.get("company", "unknown")
+            )
 
-        if cursor.rowcount > 0:
-            updated += 1
-            has_email = "✉" if draft_email_json else "—"
-            has_ins   = "✓" if insights_json else "—"
-            print(f"[Storage] ✓ Enrichment saved: {lead.get('company')} "
-                  f"[insights={has_ins} email={has_email}]")
-        else:
-            print(f"[Storage] ⚠ No row found for enrichment: {lead.get('company')} (id={lead_id})")
+            insights_json    = json.dumps(lead.get("insights", {}), ensure_ascii=False) \
+                               if lead.get("insights") else None
+            draft_email_json = json.dumps(lead.get("draft_email", {}), ensure_ascii=False) \
+                               if lead.get("draft_email") else None
+            draft_emails_json = json.dumps(lead.get("draft_emails", {}), ensure_ascii=False) \
+                                if lead.get("draft_emails") else None
+            insights_quality = lead.get("insights_quality")
+            email_verified   = lead.get("email_verified", False)
 
-    conn.commit()
-    conn.close()
+            cursor.execute("""
+                UPDATE leads
+                SET insights         = %s,
+                    draft_email      = %s,
+                    draft_emails     = %s,
+                    insights_quality = %s,
+                    email_verified   = %s,
+                    status           = %s,
+                    updated_at       = %s
+                WHERE id = %s
+            """, (
+                insights_json,
+                draft_email_json,
+                draft_emails_json,
+                insights_quality,
+                email_verified,
+                "enriched" if draft_email_json else "qualified",
+                now,
+                lead_id,
+            ))
 
-    # ── Sync to JSON ──
+            if cursor.rowcount > 0:
+                updated += 1
+                has_email = "✉" if draft_email_json else "—"
+                has_ins   = "✓" if insights_json else "—"
+                print(f"[Storage] ✓ Enrichment saved: {lead.get('company')} "
+                      f"[insights={has_ins} email={has_email}]")
+            else:
+                print(f"[Storage] ⚠ No row found for enrichment: {lead.get('company')} (id={lead_id})")
+
     _sync_json_with_enrichment(enriched_leads)
-
     print(f"[Storage] Enrichment persistence done: {updated}/{len(enriched_leads)} leads updated")
     return updated
 
@@ -439,15 +577,12 @@ def _sync_json_with_enrichment(enriched_leads: list):
         )
         if entry_id in enrich_index:
             src = enrich_index[entry_id]
-
             if src.get("insights"):
                 entry["insights"] = src["insights"]
                 entry["insights_quality"] = src.get("insights_quality")
-
             if src.get("draft_email"):
                 entry["draft_email"] = src["draft_email"]
                 entry["status"]      = "enriched"
-
             entry["enriched_at"] = datetime.now().isoformat()
             updated_count += 1
 
@@ -456,34 +591,297 @@ def _sync_json_with_enrichment(enriched_leads: list):
     print(f"[Storage] JSON enrichment synced: {updated_count} leads updated")
 
 
-# ── Existing helpers ──────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def update_email_in_db(name: str, company: str, email: str, source: str):
     init_db()
-    conn    = sqlite3.connect(DB_PATH)
     now     = datetime.now().isoformat()
     lead_id = _generate_id(name, company)
-    conn.execute("""
-        UPDATE leads SET email = ?, email_source = ?, updated_at = ?
-        WHERE id = ?
-    """, (email, source, now, lead_id))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        conn.cursor().execute("""
+            UPDATE leads SET email = %s, email_source = %s, updated_at = %s
+            WHERE id = %s
+        """, (email, source, now, lead_id))
 
 
 def update_name_in_db(old_name: str, company: str, new_name: str):
     init_db()
-    conn    = sqlite3.connect(DB_PATH)
-    cursor  = conn.cursor()
     now     = datetime.now().isoformat()
     lead_id = _generate_id(old_name, company)
     print(f"[DB] Updating name for {company} → {new_name}")
-    cursor.execute("""
-        UPDATE leads SET name = ?, updated_at = ? WHERE id = ?
-    """, (new_name, now, lead_id))
-    if cursor.rowcount == 0:
-        print(f"[DB] ⚠ No row updated for {company}")
-    else:
-        print(f"[DB] ✓ Name updated")
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE leads SET name = %s, updated_at = %s WHERE id = %s
+        """, (new_name, now, lead_id))
+        if cursor.rowcount == 0:
+            print(f"[DB] ⚠ No row updated for {company}")
+        else:
+            print(f"[DB] ✓ Name updated")
+
+
+# ── Campaign events ──────────────────────────────────────────────────────────
+
+def log_campaign_event(campaign_id: str, agent: str, event_type: str,
+                       message: str, metadata: dict = None):
+    """Log a pipeline event for the campaign timeline."""
+    try:
+        with get_conn() as conn:
+            conn.cursor().execute("""
+                INSERT INTO campaign_events (campaign_id, agent, event_type, message, metadata)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (
+                campaign_id, agent, event_type, message,
+                json.dumps(metadata) if metadata else None,
+            ))
+    except Exception as e:
+        print(f"[Storage] Event log error: {e}")
+
+
+def get_campaign_events(campaign_id: str) -> list:
+    """Get all events for a campaign, ordered chronologically."""
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT * FROM campaign_events
+            WHERE campaign_id = %s
+            ORDER BY created_at ASC
+        """, (campaign_id,))
+        rows = cursor.fetchall()
+        for r in rows:
+            if r.get("created_at") and hasattr(r["created_at"], "isoformat"):
+                r["created_at"] = r["created_at"].isoformat()
+            if r.get("metadata") and isinstance(r["metadata"], str):
+                try:
+                    r["metadata"] = json.loads(r["metadata"])
+                except Exception:
+                    pass
+        return [dict(r) for r in rows]
+
+
+# ── Campaign status ──────────────────────────────────────────────────────────
+
+def update_campaign_status(campaign_id: str, status: str):
+    """Update campaign status: pending → collecting → qualifying → enriching → drafts_ready → sending → completed."""
+    with get_conn() as conn:
+        conn.cursor().execute("""
+            UPDATE campaigns SET status = %s, updated_at = %s WHERE id = %s
+        """, (status, datetime.now().isoformat(), campaign_id))
+
+
+def save_campaign_criteria(campaign_id: str, criteria: dict):
+    """Save parsed criteria on the campaign for similarity matching."""
+    with get_conn() as conn:
+        conn.cursor().execute("""
+            UPDATE campaigns SET criteria = %s WHERE id = %s
+        """, (json.dumps(criteria, ensure_ascii=False), campaign_id))
+
+
+# ── Similar campaign detection ───────────────────────────────────────────────
+
+def find_similar_campaign(criteria: dict) -> dict | None:
+    """Find an existing campaign with matching job_titles + location (Level 3 similarity)."""
+    target_roles    = set(r.lower() for r in criteria.get("job_titles", []))
+    target_location = (criteria.get("location") or "").lower().strip()
+
+    if not target_roles or not target_location:
+        return None
+
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM campaigns WHERE criteria IS NOT NULL ORDER BY created_at DESC")
+        for row in cursor.fetchall():
+            try:
+                old = json.loads(row["criteria"])
+                old_roles    = set(r.lower() for r in old.get("job_titles", []))
+                old_location = (old.get("location") or "").lower().strip()
+
+                if old_roles == target_roles and old_location == target_location:
+                    return dict(row)
+            except Exception:
+                continue
+    return None
+
+
+# ── Exclusion list ───────────────────────────────────────────────────────────
+
+def add_exclusion(value: str, exc_type: str, reason: str = None):
+    """Add a company or domain to the exclusion list.
+    exc_type: 'company' | 'domain' | 'email'
+    """
+    with get_conn() as conn:
+        conn.cursor().execute("""
+            INSERT INTO exclusion_list (value, type, reason)
+            VALUES (%s, %s, %s)
+        """, (value.lower().strip(), exc_type, reason))
+
+
+def get_exclusion_list() -> list:
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM exclusion_list ORDER BY created_at DESC")
+        rows = cursor.fetchall()
+        for r in rows:
+            if r.get("created_at") and hasattr(r["created_at"], "isoformat"):
+                r["created_at"] = r["created_at"].isoformat()
+        return [dict(r) for r in rows]
+
+
+def remove_exclusion(exclusion_id: int):
+    with get_conn() as conn:
+        conn.cursor().execute("DELETE FROM exclusion_list WHERE id = %s", (exclusion_id,))
+
+
+def is_excluded(company: str = None, domain: str = None, email: str = None) -> bool:
+    """Check if a company, domain, or email is in the exclusion list."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        checks = []
+        if company:
+            checks.append(("company", company.lower().strip()))
+        if domain:
+            checks.append(("domain", domain.lower().strip()))
+        if email:
+            checks.append(("email", email.lower().strip()))
+
+        for exc_type, val in checks:
+            cursor.execute(
+                "SELECT id FROM exclusion_list WHERE type = %s AND value = %s",
+                (exc_type, val)
+            )
+            if cursor.fetchone():
+                return True
+    return False
+
+
+# ── Sender config ────────────────────────────────────────────────────────────
+
+def save_sender_config(name: str, email: str, title: str = "",
+                       company: str = "", signature: str = "", is_default: bool = False):
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if is_default:
+            cursor.execute("UPDATE sender_config SET is_default = FALSE")
+        cursor.execute("""
+            INSERT INTO sender_config (name, email, title, company, signature, is_default)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (name, email, title, company, signature, is_default))
+
+
+def get_sender_config(default_only: bool = True) -> dict | None:
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        if default_only:
+            cursor.execute("SELECT * FROM sender_config WHERE is_default = TRUE LIMIT 1")
+        else:
+            cursor.execute("SELECT * FROM sender_config ORDER BY is_default DESC, created_at DESC")
+            return [dict(r) for r in cursor.fetchall()]
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def update_sender_config(sender_id: int, **fields):
+    allowed = {"name", "email", "title", "company", "signature", "is_default"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if updates.get("is_default"):
+            cursor.execute("UPDATE sender_config SET is_default = FALSE")
+        sets   = ", ".join(f"{k} = %s" for k in updates)
+        values = list(updates.values()) + [sender_id]
+        cursor.execute(f"UPDATE sender_config SET {sets} WHERE id = %s", values)
+
+
+# ── SMTP verification status ─────────────────────────────────────────────────
+
+def update_email_verification(lead_id: str, verified: bool):
+    with get_conn() as conn:
+        conn.cursor().execute("""
+            UPDATE leads SET email_verified = %s, updated_at = %s WHERE id = %s
+        """, (verified, datetime.now().isoformat(), lead_id))
+
+
+# ── Email Sequence Management ────────────────────────────────────────────────
+
+def create_full_sequence(lead_id: str, campaign_id: str, variant: str,
+                        initial_subject: str, initial_body: str,
+                        followup_emails: list, cc: str = None) -> list:
+    """Create a full 4-step email sequence (initial + 3 follow-ups)."""
+    from datetime import timedelta
+    
+    now = datetime.now()
+    sequence_steps = [
+        {"step": 0, "delay_days": 0, "subject": initial_subject, "body": initial_body},
+        {"step": 1, "delay_days": 3, "subject": followup_emails[0]['subject'], "body": followup_emails[0]['body']},
+        {"step": 2, "delay_days": 7, "subject": followup_emails[1]['subject'], "body": followup_emails[1]['body']},
+        {"step": 3, "delay_days": 14, "subject": followup_emails[2]['subject'], "body": followup_emails[2]['body']},
+    ]
+    
+    sequence_ids = []
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        for seq in sequence_steps:
+            scheduled_for = now + timedelta(days=seq['delay_days'])
+            cursor.execute("""
+                INSERT INTO email_sequences
+                    (lead_id, campaign_id, step, variant, subject, body, cc, status, scheduled_for)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'scheduled', %s)
+                RETURNING id
+            """, (lead_id, campaign_id, seq['step'], variant, seq['subject'], seq['body'], cc, scheduled_for))
+            sequence_ids.append(cursor.fetchone()[0])
+    return sequence_ids
+
+
+def get_due_sequences() -> list:
+    """Get email sequences due to be sent."""
+    now = datetime.now()
+    
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT es.*, l.name, l.company, l.email
+            FROM email_sequences es
+            JOIN leads l ON es.lead_id = l.id
+            WHERE es.status = 'scheduled' AND es.scheduled_for <= %s
+            ORDER BY es.scheduled_for
+        """, (now,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_sequence_status(sequence_id: int, status: str,
+                          message_id: str = None, error_message: str = None):
+    """Update sequence step status."""
+    now = datetime.now()
+    
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE email_sequences
+            SET status = %s, sent_at = %s, message_id = %s, error_message = %s
+            WHERE id = %s
+        """, (status, now if status == 'sent' else None, message_id, error_message, sequence_id))
+
+
+def cancel_remaining_sequence(lead_id: str, reason: str = "Lead replied"):
+    """Cancel remaining scheduled emails for a lead."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE email_sequences
+            SET status = 'cancelled', error_message = %s
+            WHERE lead_id = %s AND status = 'scheduled'
+        """, (reason, lead_id))
+
+
+def get_lead_sequence(lead_id: str) -> list:
+    """Get full email sequence for a lead."""
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT * FROM email_sequences
+            WHERE lead_id = %s
+            ORDER BY step
+        """, (lead_id,))
+        return [dict(row) for row in cursor.fetchall()]

@@ -121,15 +121,32 @@ def run_collector(campaign_prompt: str, criteria: dict) -> str:
             )
 
         # Debug: show what came back
+        content_len = len(content or "")
         preview = (content or "")[:300].replace("\n", " ")
-        print(f"[Collector] LLM response preview: {preview}")
+        print(f"[Collector] LLM response: {content_len} chars, preview: {preview}")
+        
+        # Show last 100 chars to see if truncated
+        if content_len > 300:
+            tail = content[-100:].replace("\n", " ")
+            print(f"[Collector] Response tail: ...{tail}")
 
         if detect_truncation(content or "", context="Collector LLM extraction"):
             print("[Collector] ⚠ Response may be incomplete — attempting recovery.")
 
         # Quick check: does it contain a JSON array?
         if content and ("[" in content):
-            return content
+            # Try to parse immediately to verify it's valid
+            from utils.json_utils import extract_json_list
+            test_parse = extract_json_list(content, context=f"Collector attempt {attempt}")
+            if test_parse:
+                print(f"[Collector] ✓ Extracted {len(test_parse)} leads")
+                return content
+            else:
+                print(f"[Collector] ⚠ Found '[' but extraction failed")
+                if attempt < 2:
+                    continue  # Try again
+                else:
+                    return content  # Return anyway, let downstream handle it
 
         print(f"[Collector] ⚠ No JSON array found in response (attempt {attempt})")
 

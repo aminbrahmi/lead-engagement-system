@@ -34,3 +34,8 @@ uvicorn
 streamlit
 litellm
 crawlee[playwright]
+
+websockets
+psycopg2-binary
+
+dnspython  

@@ -30,7 +30,7 @@ resp = requests.post(
         "domain":  "mirelo.ai",
         "enrich":  True
     },
-    timeout=30
+    timeout=90
 )
 
 print(f"Status  : {resp.status_code}")

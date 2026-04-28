@@ -205,7 +205,7 @@ class EmailFinderTool(BaseTool):
                          "Content-Type": "application/json"},
                 json={"name": first, "surname": last,
                       "domain": domain, "enrich": True},
-                timeout=30,
+                timeout=45,
             )
             if resp.status_code == 200:
                 data = resp.json().get("data", {})

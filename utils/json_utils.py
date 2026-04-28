@@ -71,11 +71,13 @@ def extract_json_list(text: str, context: str = "") -> list:
     except json.JSONDecodeError:
         pass
 
-    # 2. Regex for complete [...] block
+    # 2. Regex for complete [...] block - find the outermost array
     match = re.search(r'\[.*\]', text, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group(0))
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, list):
+                return parsed
         except json.JSONDecodeError:
             pass
 
@@ -83,18 +85,38 @@ def extract_json_list(text: str, context: str = "") -> list:
     truncated = detect_truncation(text, context=context)
 
     if text.lstrip().startswith('['):
+        # Strategy: find all complete objects {...} and build a valid array
+        # This handles mid-string truncation better
+        
+        # First, try to close at last complete object
         last_brace = text.rfind('}')
         if last_brace > 0:
+            # Find if there's a comma after this brace (incomplete next object)
+            after_brace = text[last_brace+1:].lstrip()
+            
+            # Attempt 1: Close right after the last }
             attempt = text[:last_brace + 1].rstrip(', \t\n\r') + '\n]'
             attempt = sanitize_json_text(attempt)
             try:
                 recovered = json.loads(attempt)
-                if isinstance(recovered, list):
+                if isinstance(recovered, list) and len(recovered) > 0:
                     print(f"[JSON Recovery] {context}: salvaged {len(recovered)} "
                           f"items from truncated response")
                     return recovered
             except json.JSONDecodeError:
                 pass
+            
+            # Attempt 2: If there's a comma, try to close before it
+            if ',' in after_brace[:10]:
+                attempt = text[:last_brace + 1] + '\n]'
+                attempt = sanitize_json_text(attempt)
+                try:
+                    recovered = json.loads(attempt)
+                    if isinstance(recovered, list) and len(recovered) > 0:
+                        print(f"[JSON Recovery] {context}: salvaged {len(recovered)} items")
+                        return recovered
+                except json.JSONDecodeError:
+                    pass
 
     if truncated:
         print(f"[JSON Recovery] {context}: could not recover any items")
