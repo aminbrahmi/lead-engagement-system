@@ -134,7 +134,9 @@ def generate_emails_node(state: LeadPipelineState) -> dict:
         print(f"[Agent 4] ⚠ Running with degraded data (skipped: {', '.join(skipped_agents)})")
 
     try:
-        with_emails = run_email_generator(enriched, state["campaign_prompt"])
+        from memory.storage import get_sender_config
+        sender_info = get_sender_config(default_only=True) or {}
+        with_emails = run_email_generator(enriched, state["campaign_prompt"], sender_info)
         save_enrichment_results(with_emails)
 
         generated = [l for l in with_emails if l.get("draft_email")]

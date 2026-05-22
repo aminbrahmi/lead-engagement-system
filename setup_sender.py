@@ -27,7 +27,10 @@ def setup_sender():
         "email": "aminebrahmity12@gmail.com",
         "title": "Growth Lead",
         "company": "TALAN",
-        "signature": "Best regards,\nAmine Brahmi\nGrowth Lead",
+        "company_description": "Global consulting firm specializing in AI and digital transformation",
+        "company_url": "https://talan.com",
+        "company_location": "Paris, France",
+        "company_size": "5000+ employees",
         "is_default": True
     }
     

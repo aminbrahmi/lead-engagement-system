@@ -39,3 +39,6 @@ websockets
 psycopg2-binary
 
 dnspython  
+
+google-api-python-client
+google-auth-oauthlib

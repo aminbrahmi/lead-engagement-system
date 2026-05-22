@@ -13,6 +13,23 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
+def _clean_body(text: str) -> str:
+    """Normalize LLM email body: fix escaped newlines, strip spaces, collapse blank lines."""
+    # LLM sometimes outputs \\n (JSON-escaped) instead of real newlines
+    text = text.replace('\\n', '\n')
+    lines = [l.strip() for l in text.splitlines()]
+    result, blanks = [], 0
+    for line in lines:
+        if line == "":
+            blanks += 1
+            if blanks <= 1:
+                result.append(line)
+        else:
+            blanks = 0
+            result.append(line)
+    return "\n".join(result).strip()
+
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.llm_factory import get_writer_llm
@@ -29,26 +46,64 @@ _SYSTEM = (
 )
 
 
-def _email_prompt_variant_a(lead: dict, campaign_prompt: str, sender_info: dict) -> str:
-    """Variant A: Insight-led opener — leads with a specific fact."""
-    insights = lead.get("insights", {})
-    sender_name = sender_info.get("name", "[Your Name]")
-    sender_title = sender_info.get("title", "")
-    sender_company = sender_info.get("company", "")
+def _build_sender_blocks(sender_info: dict):
+    """Return (signature_block, intro_line, website_line) strings."""
+    sender_name    = (sender_info.get("name") or "").strip()
+    sender_title   = (sender_info.get("title") or "").strip()
+    sender_company = (sender_info.get("company") or "").strip()
+    company_url    = (sender_info.get("company_url") or "").strip()
+    company_desc   = (sender_info.get("company_description") or "").strip()
 
-    signature_block = sender_name
+    # Signature block for sign-off
     if sender_title and sender_company:
-        signature_block = f"{sender_name}\n{sender_title}, {sender_company}"
+        sig = f"{sender_name}\n{sender_title}, {sender_company}"
     elif sender_company:
-        signature_block = f"{sender_name}\n{sender_company}"
+        sig = f"{sender_name}\n{sender_company}"
+    else:
+        sig = sender_name or "[Your Name]"
+
+    # One-line sender intro — only if we have real data
+    if sender_title and sender_company:
+        intro = f"My name is {sender_name}, {sender_title} at {sender_company}"
+        if company_desc:
+            intro += f" — {company_desc}"
+        intro += "."
+    elif sender_company:
+        intro = f"My name is {sender_name} from {sender_company}."
+    elif sender_name:
+        intro = f"My name is {sender_name}."
+    else:
+        intro = ""   # no sender info — skip the intro line entirely
+
+    # Website invitation (only if URL is configured)
+    website = ""
+    if company_url:
+        website = f"If you'd like to learn more about what we do, feel free to visit us at {company_url}"
+
+    return sig, intro, website
+
+
+def _email_prompt_variant_a(lead: dict, campaign_prompt: str, sender_info: dict) -> str:
+    """Variant A: Insight-led opener."""
+    insights   = lead.get("insights", {})
+    first_name = (lead.get("name") or "").split()[0] or "there"
+    sig, sender_intro, website_line = _build_sender_blocks(sender_info)
+    company_url = (sender_info.get("company_url") or "").strip()
+
+    intro_instruction = (
+        f'Paragraph 2 — SENDER INTRO: "{sender_intro}"'
+        if sender_intro else
+        "Paragraph 2 — SENDER INTRO: (skip — no sender info provided)"
+    )
+    website_instruction = (
+        f'Paragraph 6 — WEBSITE: "{website_line}" — include the URL {company_url} verbatim'
+        if website_line else
+        "Paragraph 6 — WEBSITE: (skip — no website URL configured)"
+    )
 
     return f"""Campaign goal: {campaign_prompt}
 
-Lead:
-  Name:    {lead.get('name')}
-  Role:    {lead.get('role')}
-  Company: {lead.get('company')}
-  Email:   {lead.get('email')}
+Lead: {lead.get('name')}, {lead.get('role')} at {lead.get('company')}
 
 Research insights:
   Recent news:       {insights.get('recent_news', 'N/A')}
@@ -58,20 +113,33 @@ Research insights:
   Icebreaker:        {insights.get('icebreaker', 'N/A')}
   Value angle:       {insights.get('value_angle', 'N/A')}
 
-Write VARIANT A — the "insight-led" cold email. Rules:
-  - Subject line: specific, professional, max 8 words, no clickbait, no emojis
-  - Opening line: reference a SPECIFIC fact — the recent news, funding, or icebreaker
-  - Second paragraph: connect their specific challenge to what you can help with (use value_angle)
-  - Third paragraph: brief credibility — mention similar companies helped or a concrete metric
-  - Closing: professional soft CTA — suggest a brief conversation, no pressure language
-  - Tone: executive peer-to-peer, confident but not pushy, zero fluff
-  - Length: 5-7 sentences across 3-4 short paragraphs
-  - No exclamation marks, no "I hope this finds you well", no "I came across"
-  - Sign off with:
-    Best regards,
-    {signature_block}
+Write VARIANT A (insight-led). The body MUST be structured as SEPARATE PARAGRAPHS separated by blank lines:
 
-Return ONLY raw JSON (no fences):
+Paragraph 1 — GREETING (alone on its own line): "Hi {first_name},"
+
+{intro_instruction}
+
+Paragraph 3 — HOOK: 1-2 sentences referencing a SPECIFIC fact (icebreaker, recent news, or funding). No generic openers.
+
+Paragraph 4 — VALUE: Connect their company challenge to how you can help (use value_angle). 2 sentences max.
+
+Paragraph 5 — CREDIBILITY: One concrete metric or reference to similar companies you have helped. 1-2 sentences.
+
+{website_instruction}
+
+Paragraph 7 — CTA: One soft professional ask for a brief conversation. No pressure.
+
+Paragraph 8 — SIGN-OFF:
+Best regards,
+{sig}
+
+Rules:
+  - Subject: specific, max 8 words, no clickbait, no emoji
+  - Write in short paragraphs, one blank line between each
+  - No exclamation marks, no "I hope this finds you well"
+  - Total: 6-8 sentences
+
+Return ONLY raw JSON (no markdown fences):
 {{
   "subject": "...",
   "body": "...",
@@ -81,25 +149,26 @@ Return ONLY raw JSON (no fences):
 
 
 def _email_prompt_variant_b(lead: dict, campaign_prompt: str, sender_info: dict) -> str:
-    """Variant B: Challenge-led opener — leads with the company problem."""
-    insights = lead.get("insights", {})
-    sender_name = sender_info.get("name", "[Your Name]")
-    sender_title = sender_info.get("title", "")
-    sender_company = sender_info.get("company", "")
+    """Variant B: Challenge-led opener."""
+    insights   = lead.get("insights", {})
+    first_name = (lead.get("name") or "").split()[0] or "there"
+    sig, sender_intro, website_line = _build_sender_blocks(sender_info)
+    company_url = (sender_info.get("company_url") or "").strip()
 
-    signature_block = sender_name
-    if sender_title and sender_company:
-        signature_block = f"{sender_name}\n{sender_title}, {sender_company}"
-    elif sender_company:
-        signature_block = f"{sender_name}\n{sender_company}"
+    intro_instruction = (
+        f'Paragraph 2 — SENDER INTRO: "{sender_intro}"'
+        if sender_intro else
+        "Paragraph 2 — SENDER INTRO: (skip — no sender info provided)"
+    )
+    website_instruction = (
+        f'Paragraph 6 — WEBSITE: "{website_line}" — include the URL {company_url} verbatim'
+        if website_line else
+        "Paragraph 6 — WEBSITE: (skip — no website URL configured)"
+    )
 
     return f"""Campaign goal: {campaign_prompt}
 
-Lead:
-  Name:    {lead.get('name')}
-  Role:    {lead.get('role')}
-  Company: {lead.get('company')}
-  Email:   {lead.get('email')}
+Lead: {lead.get('name')}, {lead.get('role')} at {lead.get('company')}
 
 Research insights:
   Recent news:       {insights.get('recent_news', 'N/A')}
@@ -109,20 +178,33 @@ Research insights:
   Icebreaker:        {insights.get('icebreaker', 'N/A')}
   Value angle:       {insights.get('value_angle', 'N/A')}
 
-Write VARIANT B — the "challenge-led" cold email. Rules:
-  - Subject line: different from variant A, focused on the challenge/problem, max 8 words
-  - Opening line: name a specific challenge their company faces (use company_challenge) — frame it as an observation, not a guess
-  - Second paragraph: show you understand WHY this is hard (reference their tech stack or scale)
-  - Third paragraph: position your solution with a concrete metric or case study reference
-  - Closing: professional CTA — offer to share a relevant case study or brief insight, no "pick your brain"
-  - Tone: consultative expert, slightly more analytical than Variant A
-  - Length: 5-7 sentences across 3-4 short paragraphs
-  - No exclamation marks, no generic openers
-  - Sign off with:
-    Best regards,
-    {signature_block}
+Write VARIANT B (challenge-led). The body MUST be structured as SEPARATE PARAGRAPHS separated by blank lines:
 
-Return ONLY raw JSON (no fences):
+Paragraph 1 — GREETING (alone on its own line): "Hi {first_name},"
+
+{intro_instruction}
+
+Paragraph 3 — CHALLENGE: Name the specific challenge this company faces (use company_challenge). Frame as an observation, not a guess.
+
+Paragraph 4 — INSIGHT: Show you understand WHY this is hard — reference their tech stack or scale. 1-2 sentences.
+
+Paragraph 5 — SOLUTION: Position your value with a concrete metric or similar-company reference. 1-2 sentences.
+
+{website_instruction}
+
+Paragraph 7 — CTA: Offer to share a brief case study or insight. No "pick your brain".
+
+Paragraph 8 — SIGN-OFF:
+Best regards,
+{sig}
+
+Rules:
+  - Subject: different angle from Variant A, focused on the challenge, max 8 words, no emoji
+  - Write in short paragraphs, one blank line between each
+  - No exclamation marks, no generic openers
+  - Total: 6-8 sentences
+
+Return ONLY raw JSON (no markdown fences):
 {{
   "subject": "...",
   "body": "...",
@@ -211,10 +293,11 @@ def _generate_one(lead: dict, campaign_prompt: str, sender_info: dict) -> dict:
             HumanMessage(content=_email_prompt_variant_a(lead, campaign_prompt, sender_info)),
         ])
         email_a = _parse_email_json(response_a.content)
+        if email_a.get("body"):
+            email_a["body"] = _clean_body(email_a["body"])
         email_a.setdefault("variant", "A")
         email_a.setdefault("variant_strategy", "insight-led")
         lead["draft_emails"]["A"] = email_a
-        # Keep backward compat — draft_email = variant A
         lead["draft_email"] = email_a
         print(f"[EmailGen] ✓ Variant A written for {company}: {email_a.get('subject', '?')}")
     except Exception as e:
@@ -227,6 +310,8 @@ def _generate_one(lead: dict, campaign_prompt: str, sender_info: dict) -> dict:
             HumanMessage(content=_email_prompt_variant_b(lead, campaign_prompt, sender_info)),
         ])
         email_b = _parse_email_json(response_b.content)
+        if email_b.get("body"):
+            email_b["body"] = _clean_body(email_b["body"])
         email_b.setdefault("variant", "B")
         email_b.setdefault("variant_strategy", "challenge-led")
         lead["draft_emails"]["B"] = email_b
@@ -241,6 +326,72 @@ def _generate_one(lead: dict, campaign_prompt: str, sender_info: dict) -> dict:
         print(f"[EmailGen] ✓ {count} variant(s) ready for {company}")
 
     return lead
+
+
+def generate_reply_from_response(
+    lead: dict,
+    received_body: str,
+    original_subject: str,
+    sender_info: dict,
+) -> dict:
+    """Generate a contextual reply to a lead's response using the LLM.
+    Returns { subject, body }.
+    """
+    llm = get_writer_llm()
+    website_line = _build_sender_blocks(sender_info)[2]
+    company_url = (sender_info.get("company_url") or "").strip()
+
+    first_name = (lead.get("name") or "").split()[0] or "there"
+    role       = lead.get("role", "")
+    company    = lead.get("company", "")
+
+    website_instruction = (
+        f'If relevant, include the website line: "{website_line}"'
+        if website_line else ""
+    )
+
+    prompt = f"""You are writing a professional B2B reply email.
+
+Sender: {sender_info.get('name', '')} — {sender_info.get('title', '')} at {sender_info.get('company', '')}
+Lead: {lead.get('name', '')}, {role} at {company}
+
+Original email subject: "{original_subject}"
+
+Lead's reply:
+---
+{received_body.strip()[:1500]}
+---
+
+Write a concise, professional reply that:
+1. Starts with "Hi {first_name},"
+2. Directly addresses what they said (acknowledge their reply specifically)
+3. Moves the conversation forward (propose a next step, answer their question, or add value)
+4. Keeps it SHORT: 3-5 sentences max
+5. Ends with a clear, single call to action
+{website_instruction}
+6. Sign off:
+   Best regards,
+   {sender_info.get('name', '')}
+   {sender_info.get('title', '') + ', ' + sender_info.get('company', '') if sender_info.get('title') and sender_info.get('company') else sender_info.get('company', '')}
+
+Rules:
+- No exclamation marks
+- No generic openers ("I hope this finds you well", "Thank you for your reply")
+- Each paragraph separated by a blank line
+{f'- Include the URL {company_url} verbatim if you include the website line' if company_url else ''}
+
+Return ONLY raw JSON (no fences):
+{{"subject": "Re: {original_subject}", "body": "..."}}"""
+
+    response = llm.invoke([
+        SystemMessage(content="You are a senior B2B sales professional writing a follow-up reply. Be direct, concise and human."),
+        HumanMessage(content=prompt),
+    ])
+
+    result = _parse_email_json(response.content)
+    if result.get("body"):
+        result["body"] = _clean_body(result["body"])
+    return result
 
 
 def run_email_generator(

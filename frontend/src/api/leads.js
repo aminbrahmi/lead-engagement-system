@@ -1,4 +1,4 @@
-// src/api/leads.js
+// frontend/src/api/leads.js
 import client from "./client";
 
 export const getLeads = (campaignId) =>
@@ -13,9 +13,11 @@ export const getLeadEmails = (id) =>
 export const updateLeadEmailVariant = (id, variant, emailData) =>
   client.patch(`/leads/${id}/emails/${variant}`, emailData);
 
-// Legacy — kept for backward compat
 export const updateLeadEmail = (id, emailData) =>
   client.patch(`/leads/${id}/email`, emailData);
 
 export const updateLeadStatus = (id, status) =>
   client.patch(`/leads/${id}`, { status });
+
+export const updateLeadFields = (id, fields) =>
+  client.patch(`/leads/${id}/fields`, fields);

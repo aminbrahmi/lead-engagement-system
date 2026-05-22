@@ -15,17 +15,15 @@ Follow-up strategy:
 The scheduler (run_due_sequences) handles sending follow-ups when they're due.
 """
 
+import hashlib
 import json
 import re
 import os
 import smtplib
 import ssl
-import uuid
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr, make_msgid
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -38,96 +36,64 @@ from memory.storage import (
 
 
 # ── Follow-up LLM generation ─────────────────────────────────────────────────
-
 _FOLLOWUP_SYSTEM = (
-    "You are a senior B2B outreach strategist. You write professional follow-up emails "
-    "that feel natural, not desperate. Each follow-up must add new value — never just "
-    "'bumping this up' or 'checking in'. You reference the previous email naturally, "
-    "without quoting it. No exclamation marks. No generic openers."
+    "You write professional B2B follow-up emails. STRICT RULES:\n"
+    "- Always start with 'Hi {first_name},'\n"
+    "- NEVER start with 'I wanted to follow up' or 'I came across'\n"
+    "- NEVER include signature, 'Best regards', or sign-off — it is added automatically\n"
+    "- No exclamation marks\n"
+    "- Each follow-up adds NEW value\n"
+    "- Keep SHORT: 3-5 sentences, 2-3 paragraphs max\n"
+    "- End with a specific next step"
 )
 
-
-def _followup_prompt(lead: dict, initial_email: dict, step: int,
-                     campaign_prompt: str, sender_info: dict) -> str:
-    """Generate prompt for follow-up at step 1 (J+3), 2 (J+7), or 3 (J+14)."""
+def _followup_prompt(lead, initial_email, step, campaign_prompt, sender_info):
     insights = lead.get("insights", {})
-    name = lead.get("name", "")
+    first_name = (lead.get("name") or "").split()[0] if lead.get("name") else "there"
     company = lead.get("company", "")
+    company_url = sender_info.get("company_url", "")
+    sender_desc = sender_info.get("company_description", "")
 
-    sender_name = sender_info.get("name", "[Your Name]")
-    sender_title = sender_info.get("title", "")
-    sender_company = sender_info.get("company", "")
+    sender_block = ""
+    if sender_desc:
+        sender_block = f"\nYour company: {sender_info.get('company', '')} — {sender_desc}"
+    if company_url:
+        sender_block += f"\nYour company link (include at the end): {company_url}"
 
-    signature = sender_name
-    if sender_title and sender_company:
-        signature = f"{sender_name}\n{sender_title}, {sender_company}"
-    elif sender_company:
-        signature = f"{sender_name}\n{sender_company}"
+    rules = {
+        1: f"""SHORT follow-up (3-4 sentences, 2 paragraphs):
+- Start: "Hi {first_name},"
+- Share ONE new metric or angle about their challenge — do NOT reference your previous email
+- End with: "Would a 10-minute call make sense?"
+- If company_url provided, add it naturally""",
 
-    strategies = {
-        1: {
-            "name": "Gentle nudge (J+3)",
-            "rules": (
-                "- Acknowledge you reached out a few days ago (don't quote the email)\n"
-                "- Add ONE new angle: a metric, a trend, or a specific benefit\n"
-                "- Keep it shorter than the initial email (3-4 sentences)\n"
-                "- CTA: 'Would a 10-minute call be worth it?'\n"
-                "- Tone: respectful, not pushy"
-            ),
-        },
-        2: {
-            "name": "Value-add (J+7)",
-            "rules": (
-                "- Don't mention the previous emails explicitly\n"
-                "- Share a relevant insight, stat, or mini case study\n"
-                "- Frame it as: 'thought this might be useful for you'\n"
-                "- CTA: offer to share a relevant resource or brief analysis\n"
-                "- Tone: helpful peer, zero sales pressure"
-            ),
-        },
-        3: {
-            "name": "Breakup email (J+14)",
-            "rules": (
-                "- Acknowledge this is the last follow-up\n"
-                "- Be direct: 'if this isn't relevant, no worries at all'\n"
-                "- Leave the door open: 'happy to reconnect if timing changes'\n"
-                "- Keep it very short (2-3 sentences max)\n"
-                "- Tone: professional, graceful exit"
-            ),
-        },
+        2: f"""VALUE-ADD follow-up (4-5 sentences, 2-3 paragraphs):
+- Start: "Hi {first_name},"
+- Lead with a useful industry trend relevant to {company}
+- Connect it to a specific outcome for them
+- Offer to share a brief analysis
+- Do NOT mention previous emails""",
+
+        3: f"""FINAL follow-up (2-3 sentences max):
+- Start: "Hi {first_name},"
+- Be direct: "if [their challenge] isn't a priority now, completely understood"
+- Leave door open with company_url if available
+- Keep it very short""",
     }
-
-    strat = strategies.get(step, strategies[1])
 
     return f"""Campaign: {campaign_prompt}
 
-Lead:
-  Name:    {name}
-  Role:    {lead.get('role')}
-  Company: {company}
+Lead: {first_name}, {lead.get('role', '')} at {company}
+Challenge: {insights.get('company_challenge', 'N/A')}
+Value angle: {insights.get('value_angle', 'N/A')}
+Initial subject: "{initial_email.get('subject', '')}"
+{sender_block}
 
-Initial email subject: "{initial_email.get('subject', '')}"
+{rules.get(step, rules[1])}
 
-Research context:
-  Recent news:       {insights.get('recent_news', 'N/A')}
-  Company challenge: {insights.get('company_challenge', 'N/A')}
-  Value angle:       {insights.get('value_angle', 'N/A')}
+CRITICAL: Do NOT include any signature, "Best regards", or sign-off. It is added automatically after your text.
 
-Write follow-up: {strat['name']}
-
-Rules:
-{strat['rules']}
-- Subject: "Re: {initial_email.get('subject', '')}" (keep the thread)
-- No exclamation marks
-- Sign off with:
-  Best regards,
-  {signature}
-
-Return ONLY raw JSON (no fences):
-{{
-  "subject": "Re: {initial_email.get('subject', '')}",
-  "body": "..."
-}}"""
+Return ONLY JSON: {{"subject": "Re: {initial_email.get('subject', '')}", "body": "..."}}"""
 
 
 def _parse_json(content: str) -> dict:
@@ -155,7 +121,7 @@ def _parse_json(content: str) -> dict:
     b = re.search(r'"body"\s*:\s*"(.*?)"(?:\s*[,}])', content, re.DOTALL)
     return {
         "subject": s.group(1) if s else "",
-        "body": b.group(1).replace("\\n", "\n") if b else "",
+        "body": b.group(1).replace("\n", "\n") if b else "",
     }
 
 
@@ -193,68 +159,152 @@ def generate_followups(lead: dict, initial_email: dict,
 
 # ── SMTP sending ──────────────────────────────────────────────────────────────
 
-def _build_mime_message(sender_config: dict, to_email: str, subject: str,
-                        body: str, cc: str = None, message_id: str = None) -> MIMEMultipart:
-    """Build a professional MIME email message."""
-    msg = MIMEMultipart("alternative")
+def _build_mime_message(sender_config, to_email, subject, body,
+                        cc=None, message_id=None, sequence_id=None, lead_id=None,
+                        in_reply_to=None):
+    """Build MIME email with tracking pixel, wrapped links, and unsubscribe."""
+    import re
+    import urllib.parse
 
+    msg = MIMEMultipart("alternative")
     msg["From"] = formataddr((sender_config.get("name", ""), sender_config.get("email", "")))
     msg["To"] = to_email
     msg["Subject"] = subject
     msg["Message-ID"] = message_id or make_msgid()
     msg["X-Mailer"] = "LeadFlow/1.0"
-
     if cc:
         msg["Cc"] = cc
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
 
-    # Add signature to body
+    BASE_URL = os.getenv("REACT_APP_API_URL", "http://localhost:8000")
+
+    # Add signature
+# Add signature ONLY if body doesn't already contain sign-off
     signature = sender_config.get("signature", "")
-    full_body = body
-    if signature:
-        full_body = f"{body}\n\n---\n{signature}"
+    body_lower = body.lower().strip()
+    has_signoff = any(s in body_lower[-100:] for s in ["best regards", "regards,", "best,", "cheers,"])
 
-    # Plain text version
-    msg.attach(MIMEText(full_body, "plain", "utf-8"))
+    if has_signoff:
+        full_body = body  # LLM already added it — don't duplicate
+    else:
+        sig_parts = ["Best regards,", sender_config.get("name", "")]
+        title = sender_config.get("title", "")
+        company = sender_config.get("company", "")
+        if title and company:
+            sig_parts.append(f"{title}, {company}")
+        elif company:
+            sig_parts.append(company)
+        url = sender_config.get("company_url", "")
+        if url:
+            sig_parts.append(url)
+        full_body = body + "\n\n" + "\n".join(sig_parts)
 
-    # HTML version — professional formatting
+    if signature and signature not in full_body:
+        full_body = full_body + "\n\n" + signature
+
+    # Unsubscribe link (RGPD)
+    unsub_token = hashlib.md5(f"unsub-{lead_id}".encode()).hexdigest()[:16] if lead_id else ""
+    unsub_url = f"{BASE_URL}/unsubscribe/{lead_id}/{unsub_token}" if lead_id else ""
+
+    # Plain text (no tracking possible)
+    plain = full_body
+    if unsub_url:
+        plain += f"\n\nUnsubscribe: {unsub_url}"
+    msg.attach(MIMEText(plain, "plain", "utf-8"))
+
+    # HTML version with tracking
     html_body = full_body.replace("\n\n", "</p><p>").replace("\n", "<br>")
-    html = f"""
-    <html>
-    <body style="font-family: Arial, sans-serif; font-size: 14px; color: #1a1a2e; line-height: 1.7;">
-      <p>{html_body}</p>
-    </body>
-    </html>
-    """
-    msg.attach(MIMEText(html, "html", "utf-8"))
 
+    # Auto-link bare URLs — strip trailing punctuation (.,;:!?) so "visit https://x.com." works
+    def _autolink(m):
+        url = m.group(1)
+        # Remove trailing punctuation that belongs to the surrounding sentence
+        stripped = url.rstrip(".,;:!?)")
+        tail = url[len(stripped):]
+        return f'<a href="{stripped}" style="color:#6c5ce7">{stripped}</a>{tail}'
+
+    html_body = re.sub(
+        r'(?<!href=["\'])(?<!src=["\'])(https?://[^\s<>"\']+)',
+        _autolink,
+        html_body,
+    )
+
+    # Wrap company_url for click tracking (overwrites auto-link above)
+    if sequence_id and sender_config.get("company_url"):
+        raw_url = sender_config["company_url"]
+        tracked_url = f"{BASE_URL}/track/click/{sequence_id}?url={urllib.parse.quote(raw_url, safe='')}"
+        # Replace the auto-linked version with the tracked version
+        html_body = re.sub(
+            r'<a href="[^"]*"[^>]*>' + re.escape(raw_url) + r'</a>',
+            f'<a href="{tracked_url}" style="color:#6c5ce7">{raw_url}</a>',
+            html_body,
+        )
+
+    # Open tracking pixel
+    pixel_html = ""
+    if sequence_id:
+        pixel_token = hashlib.md5(f"open-{sequence_id}".encode()).hexdigest()[:16]
+        pixel_html = f'<img src="{BASE_URL}/track/open/{sequence_id}/{pixel_token}" width="1" height="1" style="display:none" />'
+
+    # Unsubscribe footer
+    unsub_html = ""
+    if unsub_url:
+        unsub_html = f'<p style="font-size:11px;color:#999;margin-top:30px;border-top:1px solid #eee;padding-top:10px"><a href="{unsub_url}" style="color:#999">Unsubscribe</a></p>'
+
+    html = f"""<html><body style="font-family:Arial,sans-serif;font-size:14px;color:#1a1a2e;line-height:1.7">
+    <p>{html_body}</p>
+    {unsub_html}
+    {pixel_html}
+    </body></html>"""
+
+    msg.attach(MIMEText(html, "html", "utf-8"))
     return msg
 
 
-def send_email(sender_config: dict, to_email: str, subject: str, body: str,
-               cc: str = None) -> dict:
+def send_email(sender_config, to_email, subject, body,
+               cc=None, sequence_id=None, lead_id=None, in_reply_to=None):
     """Send a single email via SMTP. Returns {success, message_id, error}."""
-    smtp_host = sender_config.get("smtp_host", os.getenv("SMTP_HOST", "smtp.gmail.com"))
-    smtp_port = sender_config.get("smtp_port", int(os.getenv("SMTP_PORT", "587")))
+    # Use `or` (not default arg) so None values from DB also fall back to env
+    smtp_host = sender_config.get("smtp_host") or os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = sender_config.get("smtp_port") or int(os.getenv("SMTP_PORT", "587"))
     smtp_user = sender_config.get("smtp_user") or sender_config.get("email") or os.getenv("SMTP_USER", "")
     smtp_pass = sender_config.get("smtp_pass") or os.getenv("SMTP_PASS", "")
 
     if not smtp_user or not smtp_pass:
         return {"success": False, "message_id": None, "error": "SMTP credentials not configured"}
 
+    smtp_port = int(smtp_port)
+
     message_id = make_msgid()
-    msg = _build_mime_message(sender_config, to_email, subject, body, cc, message_id)
+    msg = _build_mime_message(sender_config, to_email, subject, body, cc, message_id,
+        sequence_id=sequence_id, lead_id=lead_id, in_reply_to=in_reply_to,
+    )
+
+    recipients = [to_email]
+    if cc:
+        recipients.extend([addr.strip() for addr in cc.split(",") if addr.strip()])
 
     try:
         context = ssl.create_default_context()
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-            server.starttls(context=context)
-            server.login(smtp_user, smtp_pass)
+        # Port 465 = implicit SSL (SMTP_SSL); port 587 = STARTTLS — never mix them
+        use_ssl = smtp_port == 465
 
-            recipients = [to_email]
-            if cc:
-                recipients.extend([addr.strip() for addr in cc.split(",") if addr.strip()])
-
-            server.sendmail(smtp_user, recipients, msg.as_string())
+        if use_ssl:
+            # SMTP_SSL — SSL from the start (port 465)
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=30) as server:
+                server.ehlo()
+                server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_user, recipients, msg.as_string())
+        else:
+            # Plain SMTP + STARTTLS (port 587) — requires ehlo() before and after starttls()
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
+                server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_user, recipients, msg.as_string())
 
         print(f"[SMTP] ✓ Sent to {to_email}: {subject}")
         return {"success": True, "message_id": message_id, "error": None}
@@ -339,7 +389,10 @@ def _process_one_lead(lead: dict, campaign_prompt: str, campaign_id: str,
 
     # ── Step 3: Send the initial email (step 0) ─────────────────────────────
     print(f"[Sender] Sending initial email to {email}…")
-    result = send_email(sender_info, email, initial_subject, initial_body, cc)
+    result = result = send_email(
+        sender_info, email, initial_subject, initial_body, cc,
+        sequence_id=seq_ids[0], lead_id=lead_id,
+    )
 
     if result["success"]:
         update_sequence_status(seq_ids[0], "sent", message_id=result["message_id"])
@@ -494,6 +547,7 @@ def run_due_sequences() -> dict:
             sender_info, email,
             seq.get("subject", ""), seq.get("body", ""),
             cc=seq.get("cc"),
+            sequence_id=seq["id"], lead_id=seq["lead_id"],
         )
 
         if result["success"]:

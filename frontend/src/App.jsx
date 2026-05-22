@@ -1,11 +1,12 @@
-// src/App.jsx
-import React, { useState, useCallback, useEffect, createContext, useContext } from "react";
+// frontend/src/App.jsx
+import React, { useState, useCallback, useEffect, useRef, createContext, useContext } from "react";
 import { BrowserRouter, Routes, Route, useNavigate } from "react-router-dom";
 import Layout from "./components/Layout";
 import CampaignPage from "./pages/CampaignPage";
 import PipelinePage from "./pages/PipelinePage";
 import LeadsPage from "./pages/LeadsPage";
 import AnalyticsPage from "./pages/AnalyticsPage";
+import InboxPage from "./pages/InboxPage";
 import usePipeline from "./hooks/usePipeline";
 import useCampaigns from "./hooks/useCampaigns";
 import { darkTheme, lightTheme } from "./styles/theme";
@@ -22,23 +23,15 @@ function AppRoutes() {
     campaignId, error, launch, disconnect,
   } = usePipeline();
   const { campaigns, fetchCampaigns, loadCampaignLeads, loading: campaignsLoading } = useCampaigns();
-
-  // Which campaign's leads are we viewing? null = latest pipeline run
   const [activeCampaignId, setActiveCampaignId] = useState(null);
 
   useEffect(() => () => disconnect(), [disconnect]);
 
-  // Launch new or re-run existing campaign
   const handleLaunch = useCallback(
-    (prompt) => {
-      launch(prompt);
-      setActiveCampaignId(null);
-      navigate("/pipeline");
-    },
+    (prompt) => { launch(prompt); setActiveCampaignId(null); navigate("/pipeline"); },
     [launch, navigate]
   );
 
-  // View an old campaign's results
   const handleViewCampaign = useCallback(
     async (campaign) => {
       const oldLeads = await loadCampaignLeads(campaign.id);
@@ -49,16 +42,16 @@ function AppRoutes() {
     [loadCampaignLeads, setLeads, navigate]
   );
 
-  // When pipeline finishes, refresh campaign list and set active
+  // Navigate to /leads only when the pipeline JUST finished (running→done), not on every re-render
+  const prevIsRunning = useRef(false);
   useEffect(() => {
-    if (leads.length > 0 && !isRunning) {
-      if (!activeCampaignId) {
-        // Pipeline just finished — refresh campaigns
-        fetchCampaigns();
-      }
+    const justFinished = prevIsRunning.current && !isRunning;
+    prevIsRunning.current = isRunning;
+    if (justFinished && leads.length > 0) {
+      fetchCampaigns();
       navigate("/leads");
     }
-  }, [leads.length, isRunning, activeCampaignId, fetchCampaigns, navigate]);
+  }, [isRunning, leads.length, fetchCampaigns, navigate]);
 
   const handleUpdateLead = useCallback(
     (leadId, updates) => {
@@ -67,7 +60,6 @@ function AppRoutes() {
     [setLeads]
   );
 
-  // Find active campaign info for display
   const activeCampaign = activeCampaignId
     ? campaigns.find((c) => c.id === activeCampaignId)
     : null;
@@ -75,31 +67,10 @@ function AppRoutes() {
   return (
     <Routes>
       <Route element={<Layout isRunning={isRunning} leadsCount={leads.length} />}>
-        <Route
-          index
-          element={
-            <CampaignPage
-              onLaunch={handleLaunch}
-              onViewCampaign={handleViewCampaign}
-              isRunning={isRunning}
-              campaigns={campaigns}
-              campaignsLoading={campaignsLoading}
-            />
-          }
-        />
+        <Route index element={<CampaignPage onLaunch={handleLaunch} onViewCampaign={handleViewCampaign} isRunning={isRunning} campaigns={campaigns} campaignsLoading={campaignsLoading} />} />
         <Route path="pipeline" element={<PipelinePage currentStage={currentStage} logs={logs} isRunning={isRunning} />} />
-        <Route
-          path="leads"
-          element={
-            <LeadsPage
-              leads={leads}
-              onUpdateLead={handleUpdateLead}
-              activeCampaign={activeCampaign}
-              campaigns={campaigns}
-              onViewCampaign={handleViewCampaign}
-            />
-          }
-        />
+        <Route path="leads" element={<LeadsPage leads={leads} onUpdateLead={handleUpdateLead} activeCampaign={activeCampaign} campaigns={campaigns} onViewCampaign={handleViewCampaign} />} />
+        <Route path="inbox" element={<InboxPage />} />
         <Route path="analytics" element={<AnalyticsPage leads={leads} />} />
       </Route>
     </Routes>
@@ -107,7 +78,10 @@ function AppRoutes() {
 }
 
 export default function App() {
-  const [isDark, setIsDark] = useState(true);
+  // ──────────────────────────────────────────────────────────
+  // CHANGE: default to light mode (was true → now false)
+  // ──────────────────────────────────────────────────────────
+  const [isDark, setIsDark] = useState(false);
   const theme = isDark ? darkTheme : lightTheme;
   const toggleTheme = useCallback(() => setIsDark((p) => !p), []);
 

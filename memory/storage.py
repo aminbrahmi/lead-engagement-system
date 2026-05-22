@@ -58,6 +58,16 @@ def _ensure_dirs():
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
+def _safe_index(cursor, sql: str):
+    """Create index using a savepoint so a privilege error doesn't abort the transaction."""
+    try:
+        cursor.execute("SAVEPOINT _idx")
+        cursor.execute(sql)
+        cursor.execute("RELEASE SAVEPOINT _idx")
+    except Exception:
+        cursor.execute("ROLLBACK TO SAVEPOINT _idx")
+
+
 def init_db():
     _ensure_dirs()
     with get_conn() as conn:
@@ -148,16 +158,102 @@ def init_db():
                 created_at    TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        # Indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_leads_campaign ON leads(campaign)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_leads_segment ON leads(segment)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_campaign ON campaign_events(campaign_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_exclusion_type ON exclusion_list(type)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sequences_lead ON email_sequences(lead_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sequences_status ON email_sequences(status)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sequences_scheduled ON email_sequences(scheduled_for)")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id          SERIAL PRIMARY KEY,
+                campaign_id VARCHAR(12),
+                lead_id     VARCHAR(12),
+                type        VARCHAR(30) NOT NULL,
+                message     TEXT,
+                metadata    JSONB,
+                read        BOOLEAN DEFAULT FALSE,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS lead_notifications (
+                id          SERIAL PRIMARY KEY,
+                campaign_id VARCHAR(12),
+                lead_id     VARCHAR(12),
+                type        VARCHAR(30) NOT NULL,
+                message     TEXT,
+                metadata    TEXT,
+                read        BOOLEAN DEFAULT FALSE,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
 
+        # Indexes
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_leads_campaign ON leads(campaign)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_leads_segment ON leads(segment)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_events_campaign ON campaign_events(campaign_id)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_exclusion_type ON exclusion_list(type)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_sequences_lead ON email_sequences(lead_id)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_sequences_status ON email_sequences(status)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_sequences_scheduled ON email_sequences(scheduled_for)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_notif_lead ON notifications(lead_id)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_notif_read ON notifications(read)")
+
+        # ── Migrations: ajouter colonnes manquantes ──────────────────────────
+
+        cursor.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ")
+        cursor.execute("ALTER TABLE sender_config ADD COLUMN IF NOT EXISTS company_description TEXT")
+        cursor.execute("ALTER TABLE sender_config ADD COLUMN IF NOT EXISTS company_location TEXT")
+        cursor.execute("ALTER TABLE sender_config ADD COLUMN IF NOT EXISTS company_size TEXT")
+        cursor.execute("ALTER TABLE sender_config ADD COLUMN IF NOT EXISTS company_url TEXT")
+        cursor.execute("ALTER TABLE sender_config ADD COLUMN IF NOT EXISTS smtp_host TEXT")
+        cursor.execute("ALTER TABLE sender_config ADD COLUMN IF NOT EXISTS smtp_port INTEGER")
+        cursor.execute("ALTER TABLE sender_config ADD COLUMN IF NOT EXISTS smtp_user TEXT")
+        cursor.execute("ALTER TABLE sender_config ADD COLUMN IF NOT EXISTS smtp_pass TEXT")
+        cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS campaign VARCHAR(255)")
+        cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ")
+        cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ")
+        cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS clicked_at TIMESTAMPTZ")
+        cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS recipient_email TEXT")
+
+        cursor.execute("""
+            UPDATE email_sequences
+            SET campaign = campaign_id
+            WHERE campaign IS NULL AND campaign_id IS NOT NULL
+        """)
+        cursor.execute("""
+            UPDATE email_sequences
+            SET scheduled_at = scheduled_for
+            WHERE scheduled_at IS NULL AND scheduled_for IS NOT NULL
+        """)
+
+        # ── discussions / messages tables ────────────────────────────────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS discussions (
+                id              SERIAL PRIMARY KEY,
+                lead_id         VARCHAR(12) REFERENCES leads(id),
+                campaign_id     VARCHAR(12),
+                subject         TEXT,
+                status          VARCHAR(20) DEFAULT 'active',
+                has_reply       BOOLEAN DEFAULT FALSE,
+                last_message_at TIMESTAMPTZ DEFAULT NOW(),
+                created_at      TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id            SERIAL PRIMARY KEY,
+                discussion_id INTEGER REFERENCES discussions(id) ON DELETE CASCADE,
+                lead_id       VARCHAR(12),
+                direction     VARCHAR(10) NOT NULL,
+                subject       TEXT,
+                body          TEXT,
+                from_email    TEXT,
+                sequence_id   INTEGER,
+                message_id    TEXT,
+                in_reply_to   TEXT,
+                sentiment     VARCHAR(30),
+                created_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_disc_lead ON discussions(lead_id)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_msg_disc ON messages(discussion_id)")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -417,6 +513,7 @@ def update_lead_qualification(qualified_leads: list) -> int:
                 lead.get("name", "unknown"),
                 lead.get("company", "unknown")
             )
+            lead["id"] = lead_id   # ensure frontend can reference the DB id
             score   = lead.get("score", 0)
             segment = lead.get("segment", "cold")
             keep    = lead.get("keep", False)
@@ -509,6 +606,7 @@ def save_enrichment_results(enriched_leads: list) -> int:
                 lead.get("name", "unknown"),
                 lead.get("company", "unknown")
             )
+            lead["id"] = lead_id   # ensure frontend can reference the DB id
 
             insights_json    = json.dumps(lead.get("insights", {}), ensure_ascii=False) \
                                if lead.get("insights") else None
@@ -756,16 +854,59 @@ def is_excluded(company: str = None, domain: str = None, email: str = None) -> b
 
 # ── Sender config ────────────────────────────────────────────────────────────
 
-def save_sender_config(name: str, email: str, title: str = "",
-                       company: str = "", signature: str = "", is_default: bool = False):
+def save_sender_config(name, email, title="", company="", signature="",
+                       is_default=False, company_description="",
+                       company_location="", company_size="", company_url=""):
     with get_conn() as conn:
         cursor = conn.cursor()
         if is_default:
+            # Check if a default already exists — update it rather than insert a new row
+            cursor.execute("SELECT id FROM sender_config WHERE is_default = TRUE LIMIT 1")
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute("""
+                    UPDATE sender_config
+                    SET name=%s, email=%s, title=%s, company=%s, signature=%s,
+                        company_description=%s, company_location=%s,
+                        company_size=%s, company_url=%s
+                    WHERE id=%s
+                """, (name, email, title, company, signature,
+                      company_description, company_location, company_size,
+                      company_url, existing[0]))
+                return
+            # No default exists yet — clear any non-default and insert
             cursor.execute("UPDATE sender_config SET is_default = FALSE")
         cursor.execute("""
-            INSERT INTO sender_config (name, email, title, company, signature, is_default)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (name, email, title, company, signature, is_default))
+            INSERT INTO sender_config
+            (name, email, title, company, signature, is_default,
+             company_description, company_location, company_size, company_url)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (name, email, title, company, signature, is_default,
+              company_description, company_location, company_size, company_url))
+
+
+def _sender_from_env() -> dict | None:
+    """Build a sender config dict from environment variables."""
+    name  = os.getenv("SENDER_NAME", "")
+    email = os.getenv("SMTP_USER", "") or os.getenv("SENDER_EMAIL", "")
+    if not name and not email:
+        return None
+    return {
+        "name":                name,
+        "email":               email,
+        "title":               os.getenv("SENDER_TITLE", ""),
+        "company":             os.getenv("SENDER_COMPANY", ""),
+        "company_description": os.getenv("SENDER_COMPANY_DESC", ""),
+        "company_location":    os.getenv("SENDER_COMPANY_LOCATION", ""),
+        "company_size":        os.getenv("SENDER_COMPANY_SIZE", ""),
+        "company_url":         os.getenv("SENDER_COMPANY_URL", ""),
+        "signature":           os.getenv("SENDER_SIGNATURE", ""),
+        "smtp_host":           os.getenv("SMTP_HOST", "smtp.gmail.com"),
+        "smtp_port":           int(os.getenv("SMTP_PORT", "587")),
+        "smtp_user":           os.getenv("SMTP_USER", ""),
+        "smtp_pass":           os.getenv("SMTP_PASS", ""),
+        "is_default":          True,
+    }
 
 
 def get_sender_config(default_only: bool = True) -> dict | None:
@@ -775,9 +916,13 @@ def get_sender_config(default_only: bool = True) -> dict | None:
             cursor.execute("SELECT * FROM sender_config WHERE is_default = TRUE LIMIT 1")
         else:
             cursor.execute("SELECT * FROM sender_config ORDER BY is_default DESC, created_at DESC")
-            return [dict(r) for r in cursor.fetchall()]
+            rows = [dict(r) for r in cursor.fetchall()]
+            return rows if rows else ([_sender_from_env()] if _sender_from_env() else [])
         row = cursor.fetchone()
-        return dict(row) if row else None
+        if row:
+            return dict(row)
+    # Fallback to environment variables when DB table is empty
+    return _sender_from_env()
 
 
 def update_sender_config(sender_id: int, **fields):
@@ -851,17 +996,27 @@ def get_due_sequences() -> list:
 
 
 def update_sequence_status(sequence_id: int, status: str,
-                          message_id: str = None, error_message: str = None):
+                          message_id: str = None, error_message: str = None,
+                          recipient_email: str = None):
     """Update sequence step status."""
     now = datetime.now()
-    
+
     with get_conn() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE email_sequences
-            SET status = %s, sent_at = %s, message_id = %s, error_message = %s
-            WHERE id = %s
-        """, (status, now if status == 'sent' else None, message_id, error_message, sequence_id))
+        if recipient_email:
+            cursor.execute("""
+                UPDATE email_sequences
+                SET status = %s, sent_at = %s, message_id = %s, error_message = %s,
+                    recipient_email = %s
+                WHERE id = %s
+            """, (status, now if status == 'sent' else None, message_id, error_message,
+                  recipient_email, sequence_id))
+        else:
+            cursor.execute("""
+                UPDATE email_sequences
+                SET status = %s, sent_at = %s, message_id = %s, error_message = %s
+                WHERE id = %s
+            """, (status, now if status == 'sent' else None, message_id, error_message, sequence_id))
 
 
 def cancel_remaining_sequence(lead_id: str, reason: str = "Lead replied"):
@@ -885,3 +1040,129 @@ def get_lead_sequence(lead_id: str) -> list:
             ORDER BY step
         """, (lead_id,))
         return [dict(row) for row in cursor.fetchall()]
+
+
+# ── Discussions & Messages ────────────────────────────────────────────────────
+
+def get_or_create_discussion(lead_id: str, campaign_id: str, subject: str) -> int:
+    """Return existing discussion_id for a lead, or create a new one."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM discussions WHERE lead_id = %s ORDER BY created_at DESC LIMIT 1", (lead_id,))
+        row = cursor.fetchone()
+        if row:
+            # Update last_message_at
+            cursor.execute("UPDATE discussions SET last_message_at = NOW() WHERE id = %s", (row[0],))
+            return row[0]
+        cursor.execute("""
+            INSERT INTO discussions (lead_id, campaign_id, subject)
+            VALUES (%s, %s, %s) RETURNING id
+        """, (lead_id, campaign_id, subject))
+        return cursor.fetchone()[0]
+
+
+def add_message(discussion_id: int, lead_id: str, direction: str,
+                subject: str, body: str, from_email: str = None,
+                sequence_id: int = None, message_id: str = None,
+                in_reply_to: str = None, sentiment: str = None) -> int:
+    """Add a sent or received message to a discussion. Returns the new message id."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO messages
+              (discussion_id, lead_id, direction, subject, body,
+               from_email, sequence_id, message_id, in_reply_to, sentiment)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+        """, (discussion_id, lead_id, direction, subject, body,
+              from_email, sequence_id, message_id, in_reply_to, sentiment))
+        new_id = cursor.fetchone()[0]
+        # Keep discussion.last_message_at fresh
+        if direction == "received":
+            cursor.execute(
+                "UPDATE discussions SET last_message_at = NOW(), has_reply = TRUE WHERE id = %s",
+                (discussion_id,)
+            )
+        return new_id
+
+
+def get_discussions(campaign_id: str = None, limit: int = 100) -> list:
+    """Return discussions with lead info and last message preview."""
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        if campaign_id:
+            cursor.execute("""
+                SELECT d.*, l.name AS lead_name, l.company, l.email AS lead_email,
+                       l.segment,
+                       (SELECT body FROM messages WHERE discussion_id = d.id
+                        ORDER BY created_at DESC LIMIT 1) AS last_body,
+                       (SELECT direction FROM messages WHERE discussion_id = d.id
+                        ORDER BY created_at DESC LIMIT 1) AS last_direction,
+                       (SELECT COUNT(*) FROM messages WHERE discussion_id = d.id
+                        AND direction = 'received') AS reply_count
+                FROM discussions d
+                JOIN leads l ON l.id = d.lead_id
+                WHERE d.campaign_id = %s
+                ORDER BY d.last_message_at DESC
+                LIMIT %s
+            """, (campaign_id, limit))
+        else:
+            cursor.execute("""
+                SELECT d.*, l.name AS lead_name, l.company, l.email AS lead_email,
+                       l.segment,
+                       (SELECT body FROM messages WHERE discussion_id = d.id
+                        ORDER BY created_at DESC LIMIT 1) AS last_body,
+                       (SELECT direction FROM messages WHERE discussion_id = d.id
+                        ORDER BY created_at DESC LIMIT 1) AS last_direction,
+                       (SELECT COUNT(*) FROM messages WHERE discussion_id = d.id
+                        AND direction = 'received') AS reply_count
+                FROM discussions d
+                JOIN leads l ON l.id = d.lead_id
+                ORDER BY d.last_message_at DESC
+                LIMIT %s
+            """, (limit,))
+        rows = cursor.fetchall()
+        result = []
+        for r in rows:
+            r = dict(r)
+            for f in ("last_message_at", "created_at"):
+                if r.get(f) and hasattr(r[f], "isoformat"):
+                    r[f] = r[f].isoformat()
+            result.append(r)
+        return result
+
+
+def get_discussion_messages(discussion_id: int) -> list:
+    """Return all messages in a discussion ordered chronologically."""
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT * FROM messages
+            WHERE discussion_id = %s
+            ORDER BY created_at ASC
+        """, (discussion_id,))
+        rows = cursor.fetchall()
+        result = []
+        for r in rows:
+            r = dict(r)
+            if r.get("created_at") and hasattr(r["created_at"], "isoformat"):
+                r["created_at"] = r["created_at"].isoformat()
+            result.append(r)
+        return result
+
+
+def get_lead_discussion(lead_id: str) -> dict | None:
+    """Return the most recent discussion for a lead."""
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT * FROM discussions WHERE lead_id = %s ORDER BY created_at DESC LIMIT 1
+        """, (lead_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        r = dict(row)
+        for f in ("last_message_at", "created_at"):
+            if r.get(f) and hasattr(r[f], "isoformat"):
+                r[f] = r[f].isoformat()
+        return r

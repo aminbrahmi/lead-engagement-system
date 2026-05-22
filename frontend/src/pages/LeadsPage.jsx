@@ -3,6 +3,8 @@ import React, { useState } from "react";
 import LeadTable from "../components/LeadTable";
 import LeadDetail from "../components/LeadDetail";
 import { useTheme } from "../App";
+import { updateDraftEmail } from "../api/email";
+import { updateLeadFields } from "../api/leads";
 
 export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaigns, onViewCampaign }) {
   const { theme } = useTheme();
@@ -11,10 +13,42 @@ export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaig
   const [selected, setSelected] = useState(null);
   const [showDropdown, setShowDropdown] = useState(false);
 
-  const handleUpdateEmail = (leadId, emailData) => {
-    onUpdateLead(leadId, { draft_email: emailData });
+  // Wraps the global onUpdateLead: also updates `selected` and persists to DB
+  const handleUpdateLead = async (leadId, updates) => {
+    onUpdateLead(leadId, updates);
     if (selected?.id === leadId) {
-      setSelected((prev) => ({ ...prev, draft_email: emailData }));
+      setSelected((prev) => ({ ...prev, ...updates }));
+    }
+    // Persist fields that come from manual edits (not draft emails)
+    const persistable = {};
+    const persistKeys = ["email", "email_source", "email_verified", "location", "insights", "segment", "status", "score"];
+    persistKeys.forEach((k) => { if (updates[k] !== undefined) persistable[k] = updates[k]; });
+    if (Object.keys(persistable).length > 0) {
+      try { await updateLeadFields(leadId, persistable); } catch (e) { console.error("[LeadsPage] persist error", e); }
+    }
+  };
+
+  const handleUpdateEmail = async (leadId, emailData) => {
+    const variant = emailData.variant || "A";
+
+    // 1. Persist draft to backend DB
+    try {
+      await updateDraftEmail(leadId, variant, emailData.subject, emailData.body, emailData.cc);
+    } catch (err) {
+      console.error("[LeadsPage] Failed to save draft to API:", err);
+    }
+
+    // 2. Update both draft_email AND draft_emails in local state
+    const variantData = { subject: emailData.subject, body: emailData.body, cc: emailData.cc, variant };
+
+    onUpdateLead(leadId, { draft_email: variantData });
+    if (selected?.id === leadId) {
+      setSelected((prev) => {
+        const prevEmails = (typeof prev.draft_emails === "string"
+          ? JSON.parse(prev.draft_emails) : prev.draft_emails) || {};
+        const updatedEmails = { ...prevEmails, [variant]: variantData };
+        return { ...prev, draft_email: variantData, draft_emails: updatedEmails };
+      });
     }
   };
 
@@ -145,8 +179,10 @@ export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaig
       {selected && (
         <LeadDetail
           lead={selected}
+          campaignId={activeCampaign?.id || selected?.campaign}
           onClose={() => setSelected(null)}
           onUpdateEmail={handleUpdateEmail}
+          onUpdateLead={handleUpdateLead}
         />
       )}
     </div>
