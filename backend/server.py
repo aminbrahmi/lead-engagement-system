@@ -934,24 +934,35 @@ async def update_lead_email_address(lead_id: str, email_update: EmailAddressUpda
     }
  
 def _follow_up_scheduler():
-    """Background thread — follow-ups every 60 s, monitor every 5 min."""
-    print("[Scheduler] Background scheduler started (followups=60s, monitor=5min)")
+    """Background thread — tracker every 30s, follow-ups every 60s, monitor every 5min."""
+    print("[Scheduler] Background scheduler started (tracker=30s, followups=60s, monitor=5min)")
     tick = 0
     while True:
-        time.sleep(60)
+        time.sleep(30)
         tick += 1
 
-        # ── Follow-up sending (every minute) ─────────────────────────────────
+        # ── IMAP tracker (every 30 seconds) ──────────────────────────────────
         try:
-            from agents.sender_node import run_due_sequences
-            stats = run_due_sequences()
-            if stats["sent"] > 0 or stats["failed"] > 0:
-                print(f"[Scheduler] Followups: sent={stats['sent']} failed={stats['failed']}")
+            from agents.tracker_node import run_tracker
+            t = run_tracker()
+            if t["notifications"] > 0:
+                print(f"[Scheduler] Tracker: {t['matched']} matched, "
+                      f"{t['notifications']} notifications")
         except Exception as e:
-            print(f"[Scheduler] Followup error: {e}")
+            print(f"[Scheduler] Tracker error: {e}")
 
-        # ── Monitor classification (every 5 minutes) ──────────────────────────
-        if tick % 5 == 0:
+        # ── Follow-up sending (every 60 seconds = every 2 ticks) ─────────────
+        if tick % 2 == 0:
+            try:
+                from agents.sender_node import run_due_sequences
+                stats = run_due_sequences()
+                if stats["sent"] > 0 or stats["failed"] > 0:
+                    print(f"[Scheduler] Followups: sent={stats['sent']} failed={stats['failed']}")
+            except Exception as e:
+                print(f"[Scheduler] Followup error: {e}")
+
+        # ── Monitor classification (every 5 minutes = every 10 ticks) ─────────
+        if tick % 10 == 0:
             try:
                 from agents.monitor_node import run_monitor
                 m = run_monitor()
@@ -1370,10 +1381,35 @@ def _gcal_credentials():
                 pass
 
         if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            _save_token(creds)
+            try:
+                creds.refresh(Request())
+                _save_token(creds)
+            except Exception as refresh_err:
+                err_str = str(refresh_err).lower()
+                if "invalid_grant" in err_str or "token has been expired" in err_str or "revoked" in err_str:
+                    # Refresh token is dead — delete it so the UI shows "Connect Google"
+                    print(f"[GCal] Refresh token revoked — clearing stored token")
+                    if os.path.exists(_TOKEN_FILE):
+                        os.remove(_TOKEN_FILE)
+                    return None
+                raise
 
-        return creds if (creds.token or creds.refresh_token) else None
+        # Final validity check: try a lightweight token refresh to confirm it works
+        if creds.token and not creds.expired:
+            return creds
+        if creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                _save_token(creds)
+                return creds
+            except Exception as e:
+                err_str = str(e).lower()
+                if "invalid_grant" in err_str or "revoked" in err_str:
+                    print(f"[GCal] Token invalid — clearing")
+                    if os.path.exists(_TOKEN_FILE):
+                        os.remove(_TOKEN_FILE)
+                return None
+        return None
     except Exception as e:
         print(f"[GCal] Credential load error: {e}")
         return None
@@ -1542,6 +1578,11 @@ async def create_google_meet(discussion_id: int, req: ScheduleMeetRequest):
             "attendees":   [a["email"] for a in attendees],
         }
     except Exception as e:
+        err_str = str(e).lower()
+        if "invalid_grant" in err_str or "revoked" in err_str:
+            if os.path.exists(_TOKEN_FILE):
+                os.remove(_TOKEN_FILE)
+            raise HTTPException(401, "Google Calendar token expired — please reconnect via /google/calendar/auth")
         raise HTTPException(500, f"Google Calendar error: {e}")
 
 

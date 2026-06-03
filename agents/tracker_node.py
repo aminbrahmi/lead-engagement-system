@@ -18,9 +18,12 @@ import json
 import os
 import re
 import hashlib
+import threading
 from datetime import datetime
 from email.header import decode_header
 from concurrent.futures import ThreadPoolExecutor
+
+_tracker_lock = threading.Lock()
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -36,6 +39,29 @@ IMAP_USER = os.getenv("IMAP_USER") or os.getenv("SMTP_USER", "")
 IMAP_PASS = os.getenv("IMAP_PASS") or os.getenv("SMTP_PASS", "")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+# ── Persistent IMAP connection ────────────────────────────────────────────────
+_imap_conn: imaplib.IMAP4_SSL | None = None
+_imap_lock = threading.Lock()
+
+def _get_imap_conn() -> imaplib.IMAP4_SSL:
+    """Return a cached IMAP connection, reconnecting if stale or broken."""
+    global _imap_conn
+    with _imap_lock:
+        # Test if existing connection is still alive
+        if _imap_conn is not None:
+            try:
+                _imap_conn.noop()
+            except Exception:
+                _imap_conn = None
+
+        if _imap_conn is None:
+            conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+            conn.login(IMAP_USER, IMAP_PASS)
+            _imap_conn = conn
+            print(f"[IMAP] New connection established ({IMAP_HOST})")
+
+        return _imap_conn
 
 
 # ── Sentiment classification via Groq LLM ─────────────────────────────────────
@@ -217,53 +243,76 @@ def _handle_calendar_event(cal: dict, matched_seq: dict, lead_name: str,
         company     = correct["company"] or company
         print(f"[Tracker] Calendar event matched by title → {lead_name} @ {company}")
 
-    # Clean title and body
+    # Clean event title — strip timestamp suffix like " - Mon. 2"
     clean_title = re.split(r'\s+-\s+\w{3}\.?\s+\d', event_title)[0].strip()
+
+    # Build conversation body — Meet link only shown for accepted meetings
     action = {"accepted": "confirmed", "declined": "declined"}.get(status, "responded to")
     clean_body = f"Meeting {action} with {lead_name}."
-    if meet_link:
+    if meet_link and status == "accepted":
         clean_body += f"\n\nGoogle Meet: {meet_link}"
 
-    # Save as "event" message in the correct lead discussion
+    # Save as "event" message — two-level dedup:
+    #   1. by message_id (same email reprocessed)
+    #   2. by (lead_id, body, 1h window) — catches multiple Google Calendar
+    #      notification emails for the same status change (different message_ids)
+    already_saved = False
     try:
-        disc_id = get_or_create_discussion(
-            lead_id, campaign_id, event_title
-        )
+        disc_id = get_or_create_discussion(lead_id, campaign_id, event_title)
         with _gc() as conn:
             c = conn.cursor()
-            # Skip if already saved (same message_id)
+
+            # Level 1 — exact message_id
             if message_id:
                 c.execute("SELECT 1 FROM messages WHERE message_id = %s LIMIT 1", (message_id,))
                 if c.fetchone():
-                    return
-            c.execute("""
-                INSERT INTO messages
-                  (discussion_id, lead_id, direction, subject, body,
-                   message_id, notification_sent)
-                VALUES (%s, %s, 'event', %s, %s, %s, TRUE)
-            """, (disc_id, lead_id,
-                  f"Meeting {status}: {event_title}",
-                  clean_body,
-                  message_id or None))
+                    already_saved = True
+
+            # Level 2 — same lead + same body in the last hour
+            # (handles multiple Google Calendar notification emails for one event change)
+            if not already_saved:
+                c.execute("""
+                    SELECT 1 FROM messages
+                    WHERE lead_id = %s AND direction = 'event'
+                      AND body = %s
+                      AND created_at > NOW() - INTERVAL '1 hour'
+                    LIMIT 1
+                """, (lead_id, clean_body))
+                if c.fetchone():
+                    already_saved = True
+
+            if not already_saved:
+                c.execute("""
+                    INSERT INTO messages
+                      (discussion_id, lead_id, direction, subject, body,
+                       message_id, notification_sent)
+                    VALUES (%s, %s, 'event', %s, %s, %s, TRUE)
+                """, (disc_id, lead_id,
+                      f"Meeting {status}: {event_title}",
+                      clean_body,
+                      message_id or None))
     except Exception as e:
         print(f"[Tracker] Calendar event save error: {e}")
 
-    # Clean event title — strip timestamp suffix after " - "
-    clean_title = re.split(r'\s+-\s+\w{3}\.?\s+\d', event_title)[0].strip()
+    # Already saved means notification was already created — skip entirely
+    if already_saved:
+        print(f"[Tracker] Calendar event already processed — skipping notification")
+        return
 
-    # Notification — use lead_name (Alexander Matthey) not the responder (user's own name)
+    # Build notification text
     icon = {"accepted": "calendar_accepted", "declined": "calendar_declined"}.get(status, "calendar_response")
     if status == "accepted":
         msg = f"Meeting confirmed with {lead_name} @ {company}: {clean_title}"
+        if meet_link:
+            msg += f" | Meet: {meet_link}"
     elif status == "declined":
         msg = f"{lead_name} @ {company} declined the meeting: {clean_title}"
     else:
         msg = f"{lead_name} @ {company} responded ({status}) to: {clean_title}"
-    if meet_link:
-        msg += f" | Meet: {meet_link}"
 
     _create_notification(campaign_id, lead_id, icon, msg,
-                         {"meet_link": meet_link, "status": status,
+                         {"meet_link": meet_link if status == "accepted" else "",
+                          "status": status,
                           "event_title": clean_title, "lead_name": lead_name,
                           "reply_message_id": message_id})
     print(f"[Tracker] Calendar {status}: {lead_name} @ {company} — {clean_title}")
@@ -348,9 +397,7 @@ def check_inbox(since_hours: int = 24) -> list:
     replies = []
 
     try:
-        print(f"[Tracker] Connecting to IMAP {IMAP_HOST}...")
-        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        mail.login(IMAP_USER, IMAP_PASS)
+        mail = _get_imap_conn()
         mail.select("INBOX")
 
         # Search for recent emails (replies typically have "Re:" in subject)
@@ -359,14 +406,12 @@ def check_inbox(since_hours: int = 24) -> list:
         _, msg_ids = mail.search(None, f'(SINCE {since_date})')
 
         if not msg_ids[0]:
-            print("[Tracker] No new emails found.")
-            mail.logout()
             return []
 
         ids = msg_ids[0].split()
         print(f"[Tracker] Found {len(ids)} emails since {since_date}")
 
-        for msg_id in ids[-50:]:  # Process last 50 max
+        for msg_id in ids[-20:]:  # Process last 20 max (scanner tourne toutes les 2 min)
             _, msg_data = mail.fetch(msg_id, "(RFC822)")
             if not msg_data or not msg_data[0]:
                 continue
@@ -424,13 +469,15 @@ def check_inbox(since_hours: int = 24) -> list:
                 "is_reply": subject.lower().startswith("re:"),
             })
 
-        mail.logout()
         print(f"[Tracker] Parsed {len(replies)} potential replies")
 
     except imaplib.IMAP4.error as e:
         print(f"[Tracker] IMAP error: {e}")
+        global _imap_conn
+        _imap_conn = None  # force reconnect next scan
     except Exception as e:
         print(f"[Tracker] Inbox check failed: {e}")
+        _imap_conn = None
 
     return replies
 
@@ -447,36 +494,87 @@ def _strip_re(subject: str) -> str:
     return re.sub(r'^(re|fwd|fw|rép|réf)\s*:\s*', '', subject.strip(), flags=re.IGNORECASE).strip().lower()
 
 
+def _most_recent(candidates: list) -> dict | None:
+    """Among several matching sequences, return the one sent most recently."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def _ts(seq):
+        v = seq.get("sent_at")
+        if v is None:
+            return ""
+        # datetime object → isoformat; already a string → keep as-is
+        return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+    return max(candidates, key=_ts)
+
+
 def match_reply_to_lead(reply: dict, sent_sequences: list) -> dict | None:
-    """Match an incoming reply to a lead's sequence."""
-    from_email = reply.get("from_email", "").lower()
-    in_reply_to = _norm_msgid(reply.get("in_reply_to", ""))
+    """Match an incoming reply to a lead's sequence.
+
+    Steps (in order of reliability):
+      1. In-Reply-To / References  → exact message_id  (always unique)
+      2. Email + subject combined  → most recent match (handles testing with own email)
+      3. Email only                → most recently sent to that address
+      4. Lead email only           → most recently sent to that lead
+      5. Subject only              → most recently sent with that subject
+    """
+    from_email    = reply.get("from_email", "").lower()
+    in_reply_to   = _norm_msgid(reply.get("in_reply_to", ""))
     reply_subject = _strip_re(reply.get("subject", ""))
 
-    # 1. Match by In-Reply-To / References → message_id (most reliable)
+    # 1. Exact message-id — unambiguous, always preferred
     if in_reply_to:
         for seq in sent_sequences:
             stored_mid = _norm_msgid(seq.get("message_id") or "")
             if stored_mid and stored_mid == in_reply_to:
                 return seq
 
-    # 2. Match by actual recipient email stored in sequence
-    if from_email:
-        for seq in sent_sequences:
-            if seq.get("recipient_email", "").lower() == from_email:
-                return seq
+    # 2. Email + subject combined — critical when testing with own email address:
+    #    multiple leads share the same email, so the reply subject ("Re: XYZ")
+    #    uniquely identifies which lead the reply belongs to.
+    if from_email and reply_subject:
+        candidates = [
+            seq for seq in sent_sequences
+            if (seq.get("recipient_email", "").lower() == from_email
+                or seq.get("email", "").lower() == from_email)
+            and _strip_re(seq.get("subject", "")) == reply_subject
+        ]
+        match = _most_recent(candidates)
+        if match:
+            return match
 
-    # 3. Match by sender email → lead email
+    # 3. Email match only → most recently sent to that address
     if from_email:
-        for seq in sent_sequences:
-            if seq.get("email", "").lower() == from_email:
-                return seq
+        candidates = [
+            seq for seq in sent_sequences
+            if seq.get("recipient_email", "").lower() == from_email
+        ]
+        match = _most_recent(candidates)
+        if match:
+            return match
 
-    # 4. Last resort: match by subject (catches Gmail self-reply with no In-Reply-To)
+    # 4. Lead email match → most recently sent to that lead
+    if from_email:
+        candidates = [
+            seq for seq in sent_sequences
+            if seq.get("email", "").lower() == from_email
+        ]
+        match = _most_recent(candidates)
+        if match:
+            return match
+
+    # 5. Subject fallback → most recent match
     if reply_subject:
-        for seq in sent_sequences:
-            if _strip_re(seq.get("subject", "")) == reply_subject:
-                return seq
+        candidates = [
+            seq for seq in sent_sequences
+            if _strip_re(seq.get("subject", "")) == reply_subject
+        ]
+        match = _most_recent(candidates)
+        if match:
+            return match
 
     return None
 
@@ -507,8 +605,22 @@ def generate_unsubscribe_url(lead_id: str, base_url: str = "") -> str:
 
 # ── Main tracking loop ────────────────────────────────────────────────────────
 
+_last_tracker_run: datetime | None = None
+
 def run_tracker(campaign_id: str = None) -> dict:
-    """Main Agent 6 entry point: check inbox, classify, update sequences, create notifications."""
+    """Main Agent 6 entry point. Skips if already running (prevents duplicate notifications)."""
+    if not _tracker_lock.acquire(blocking=False):
+        print("[Tracker] Already running — skipping concurrent call")
+        return {"replies_found": 0, "classified": 0, "matched": 0, "notifications": 0}
+    try:
+        return _run_tracker_inner(campaign_id)
+    finally:
+        _tracker_lock.release()
+
+
+def _run_tracker_inner(campaign_id: str = None) -> dict:
+    """Internal tracker logic — called only when lock is acquired."""
+    global _last_tracker_run
     from memory.storage import (
         get_conn, update_sequence_status,
         cancel_remaining_sequence, log_campaign_event,
@@ -523,12 +635,13 @@ def run_tracker(campaign_id: str = None) -> dict:
     with get_conn() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # ── email_sequences: include 'replied' so threads with prior replies still match ──
+        # ── email_sequences — include sent_at so _most_recent() can sort correctly ──
         if campaign_id:
             cursor.execute("""
                 SELECT es.id, es.message_id, es.subject, es.lead_id, es.campaign_id,
                        l.email, l.name, l.company,
-                       COALESCE(es.recipient_email, l.email) AS recipient_email
+                       COALESCE(es.recipient_email, l.email) AS recipient_email,
+                       COALESCE(es.sent_at, es.created_at) AS sent_at
                 FROM email_sequences es JOIN leads l ON l.id = es.lead_id
                 WHERE es.campaign_id = %s AND es.status IN ('sent', 'replied')
             """, (campaign_id,))
@@ -536,18 +649,20 @@ def run_tracker(campaign_id: str = None) -> dict:
             cursor.execute("""
                 SELECT es.id, es.message_id, es.subject, es.lead_id, es.campaign_id,
                        l.email, l.name, l.company,
-                       COALESCE(es.recipient_email, l.email) AS recipient_email
+                       COALESCE(es.recipient_email, l.email) AS recipient_email,
+                       COALESCE(es.sent_at, es.created_at) AS sent_at
                 FROM email_sequences es JOIN leads l ON l.id = es.lead_id
                 WHERE es.status IN ('sent', 'replied')
             """)
         sent_sequences = [dict(r) for r in cursor.fetchall()]
 
-        # ── messages table: sent via inbox Reply composer — for In-Reply-To matching ──
+        # ── messages table: sent via inbox Reply composer — include created_at ──
         cursor.execute("""
             SELECT NULL AS id,
                    m.message_id, m.subject, m.lead_id, d.campaign_id,
                    l.email, l.name, l.company,
-                   l.email AS recipient_email
+                   l.email AS recipient_email,
+                   m.created_at AS sent_at
             FROM messages m
             JOIN discussions d ON d.id = m.discussion_id
             JOIN leads       l ON l.id = m.lead_id
@@ -555,14 +670,34 @@ def run_tracker(campaign_id: str = None) -> dict:
         """)
         sent_sequences += [dict(r) for r in cursor.fetchall()]
 
+    # Deduplicate by message_id — keep only the first occurrence per message_id
+    # (avoids double-matching when the same email exists in both tables)
+    seen_mids: set = set()
+    deduped: list = []
+    for seq in sent_sequences:
+        mid = (seq.get("message_id") or "").strip()
+        if mid and mid in seen_mids:
+            continue
+        if mid:
+            seen_mids.add(mid)
+        deduped.append(seq)
+    sent_sequences = deduped
+
     if not sent_sequences:
         print("[Tracker] No sent emails to track.")
         return stats
 
     print(f"[Tracker] Tracking {len(sent_sequences)} sent email/message references")
 
-    # 2. Check inbox for replies
-    replies = check_inbox(since_hours=48)
+    # 2. Check inbox for replies — use a tight window when called automatically
+    from datetime import timedelta
+    if _last_tracker_run:
+        delta_minutes = (datetime.now() - _last_tracker_run).total_seconds() / 60
+        since_h = max(1, min(int(delta_minutes / 60) + 1, 4))
+    else:
+        since_h = 24  # first run: look back 24h to catch anything missed
+    _last_tracker_run = datetime.now()
+    replies = check_inbox(since_hours=since_h)
     stats["replies_found"] = len(replies)
 
     # 3. Match and classify each reply
@@ -592,6 +727,12 @@ def run_tracker(campaign_id: str = None) -> dict:
                 cal, matched_seq, lead_name, company, reply.get("message_id", "")
             )
             stats["notifications"] += 1
+            continue
+
+        # ── Skip emails with empty/too-short body — avoids false "declined" on auto-replies ──
+        body_text = (reply.get("body") or "").strip()
+        if len(body_text.split()) < 4:
+            print(f"[Tracker] Body too short ({len(body_text.split())} words) — skip classification")
             continue
 
         # ── Check notification_sent BEFORE calling LLM — saves tokens ──────
@@ -755,27 +896,29 @@ def _create_notification(campaign_id: str, lead_id: str, notif_type: str,
         with get_conn() as conn:
             cursor = conn.cursor()
             if reply_mid:
-                # Exact dedup by message_id
+                # Dedup by message_id in metadata
                 cursor.execute("""
-                    SELECT id FROM lead_notifications
-                    WHERE lead_id = %s AND type = %s
-                      AND metadata::text LIKE %s
-                    LIMIT 1
-                """, (lead_id, notif_type, f'%{reply_mid}%'))
+                    INSERT INTO lead_notifications (campaign_id, lead_id, type, message, metadata)
+                    SELECT %s, %s, %s, %s, %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM lead_notifications
+                        WHERE lead_id = %s AND type = %s
+                          AND metadata::text LIKE %s
+                    )
+                """, (campaign_id, lead_id, notif_type, message, meta_str,
+                      lead_id, notif_type, f'%{reply_mid}%'))
             else:
-                # Fallback: no message_id — deduplicate by 5-minute window
+                # Dedup by exact message content — prevents identical notifications
+                # regardless of timing (covers calendar events with no message_id)
                 cursor.execute("""
-                    SELECT id FROM lead_notifications
-                    WHERE lead_id = %s AND type = %s
-                      AND created_at > NOW() - INTERVAL '5 minutes'
-                    LIMIT 1
-                """, (lead_id, notif_type))
-            if cursor.fetchone():
-                return
-            cursor.execute("""
-                INSERT INTO lead_notifications (campaign_id, lead_id, type, message, metadata)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (campaign_id, lead_id, notif_type, message, meta_str))
+                    INSERT INTO lead_notifications (campaign_id, lead_id, type, message, metadata)
+                    SELECT %s, %s, %s, %s, %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM lead_notifications
+                        WHERE lead_id = %s AND type = %s AND message = %s
+                    )
+                """, (campaign_id, lead_id, notif_type, message, meta_str,
+                      lead_id, notif_type, message))
     except Exception as e:
         print(f"[Tracker] Notification error: {e}")
 

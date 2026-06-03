@@ -1,6 +1,7 @@
 // src/components/Layout.jsx
 import React, { useState, useEffect, useRef } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import logo from "../theleadflowlogo.png";
 import { useTheme } from "../App";
 
 const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
@@ -9,6 +10,8 @@ const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
 const REPLY_TYPES = new Set([
   "reply_interested", "reply_declined", "reply_info_request",
   "reply_ooo", "email_bounced",
+  "link_clicked",
+  "calendar_accepted", "calendar_declined", "calendar_response",
 ]);
 
 const TYPE_ICON = {
@@ -32,44 +35,27 @@ function NotificationBell() {
 
   const [notifs, setNotifs]       = useState([]);
   const [showPanel, setShowPanel] = useState(false);
-  const panelRef   = useRef(null);
-  const hasUnread  = useRef(false);  // tracks if there's anything to mark read on close
+  const panelRef = useRef(null);
 
-  // \u2500\u2500 Fetch unread notifications (count only when panel closed) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  
+  // ── Fetch unread notifications ──────────────────
   const fetchNotifs = async () => {
     try {
       const res  = await fetch(`${API}/notifications?unread_only=true`);
       const data = await res.json();
       const list = data.notifications || [];
-      // Only update list when panel is closed \u2014 avoids flicker while viewing
-      setNotifs(prev => {
-        if (showPanel) return prev;  // keep current while open
-        hasUnread.current = list.length > 0;
-        return list;
-      });
+      if (!showPanel) setNotifs(list);
     } catch {}
   };
 
   // Poll every 10 s
   useEffect(() => {
     fetchNotifs();
-    const id = setInterval(fetchNotifs, 10000);
+    const id = setInterval(fetchNotifs, 3000);
     return () => clearInterval(id);
   }, []);
 
-  // When panel CLOSES \u2192 mark everything as read so they don't reappear
-  const prevShowPanel = useRef(false);
-  useEffect(() => {
-    const wasOpen = prevShowPanel.current;
-    prevShowPanel.current = showPanel;
-
-    if (wasOpen && !showPanel && hasUnread.current) {
-      // Panel just closed \u2014 persist "read" state in DB
-      fetch(`${API}/notifications/read-all`, { method: "POST" }).catch(() => {});
-      hasUnread.current = false;
-      setNotifs([]);
-    }
-  }, [showPanel]);
+  // Panel close does NOT mark anything as read \u2014 only individual clicks do
 
   // Close panel on outside click
   useEffect(() => {
@@ -156,9 +142,19 @@ function NotificationBell() {
               )}
             </span>
             {unreadCount > 0 && (
-              <span style={{ fontSize: 11, color: "#525975" }}>
-                Closes automatically on exit
-              </span>
+              <button
+                onClick={async () => {
+                  try { await fetch(`${API}/notifications/read-all`, { method: "POST" }); } catch {}
+                  setNotifs([]);
+                  setShowPanel(false);
+                }}
+                style={{
+                  fontSize: 11, color: "#6c5ce7", background: "none", border: "none",
+                  cursor: "pointer", padding: 0, fontFamily: f?.body,
+                }}
+              >
+                Mark all as read
+              </button>
             )}
           </div>
 
@@ -271,14 +267,8 @@ export default function Layout({ isRunning, leadsCount }) {
         transition: "background .3s",
       }}>
         {/* Logo */}
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{
-            width: 28, height: 28, borderRadius: 7,
-            background: `linear-gradient(135deg, ${c.accent}, ${c.hot})`,
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: 13, fontWeight: 800, color: "#fff",
-          }}>L</div>
-          <span style={{ fontSize: 16, fontWeight: 700, letterSpacing: -0.3 }}>TheLeadFlow</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <img src={logo} alt="TheLeadFlow" style={{ height: 32, width: "auto" }} />
         </div>
 
         {/* Nav */}

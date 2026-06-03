@@ -244,6 +244,11 @@ function ScheduleMeetModal({ discussion, onClose, theme }) {
         }),
       });
       const data = await res.json();
+      if (res.status === 401) {
+        // Token expired — force reconnect
+        setGcalStatus("needs_auth");
+        throw new Error("Google Calendar token expired. Please reconnect.");
+      }
       if (!res.ok) throw new Error(data.detail || "Failed to create Meet");
       setMeetLink(data.meet_link);
     } catch (e) {

@@ -1045,15 +1045,40 @@ def get_lead_sequence(lead_id: str) -> list:
 # ── Discussions & Messages ────────────────────────────────────────────────────
 
 def get_or_create_discussion(lead_id: str, campaign_id: str, subject: str) -> int:
-    """Return existing discussion_id for a lead, or create a new one."""
+    """Return existing discussion_id for a lead+campaign, or create a new one.
+
+    Priority:
+      1. Same lead + same campaign  → correct thread
+      2. Same lead (any campaign)   → fallback if campaign not found
+      3. Create new discussion      → first contact
+    """
     with get_conn() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM discussions WHERE lead_id = %s ORDER BY created_at DESC LIMIT 1", (lead_id,))
+
+        # 1. Best match: same lead AND same campaign
+        if campaign_id:
+            cursor.execute("""
+                SELECT id FROM discussions
+                WHERE lead_id = %s AND campaign_id = %s
+                ORDER BY created_at DESC LIMIT 1
+            """, (lead_id, campaign_id))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute("UPDATE discussions SET last_message_at = NOW() WHERE id = %s", (row[0],))
+                return row[0]
+
+        # 2. Fallback: same lead, no campaign filter (e.g. calendar events)
+        cursor.execute("""
+            SELECT id FROM discussions
+            WHERE lead_id = %s
+            ORDER BY created_at DESC LIMIT 1
+        """, (lead_id,))
         row = cursor.fetchone()
         if row:
-            # Update last_message_at
             cursor.execute("UPDATE discussions SET last_message_at = NOW() WHERE id = %s", (row[0],))
             return row[0]
+
+        # 3. Create new discussion
         cursor.execute("""
             INSERT INTO discussions (lead_id, campaign_id, subject)
             VALUES (%s, %s, %s) RETURNING id
