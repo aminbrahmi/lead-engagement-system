@@ -6,7 +6,7 @@ import { useTheme } from "../App";
 import { updateDraftEmail } from "../api/email";
 import { updateLeadFields } from "../api/leads";
 
-export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaigns, onViewCampaign }) {
+export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaigns, onViewCampaign, onRefresh }) {
   const { theme } = useTheme();
   const c = theme.colors;
   const f = theme.fonts;
@@ -96,7 +96,23 @@ export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaig
           )}
         </div>
 
-        {/* Right: campaign switcher dropdown */}
+        {/* Right: refresh + campaign switcher */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        {onRefresh && (
+          <button
+            onClick={onRefresh}
+            style={{
+              padding: "6px 14px", borderRadius: 6,
+              border: `1px solid ${c.border}`, background: c.surface,
+              color: c.textMuted, fontSize: 12, cursor: "pointer",
+              fontFamily: f.body, fontWeight: 500, display: "flex",
+              alignItems: "center", gap: 6,
+            }}
+            title="Refresh leads"
+          >
+            &#8635; Refresh
+          </button>
+        )}
         {campaigns && campaigns.length > 0 && (
           <div style={{ position: "relative" }}>
             <button
@@ -170,10 +186,19 @@ export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaig
             )}
           </div>
         )}
+        </div>
       </div>
 
       {/* ── Lead table ── */}
-      <LeadTable leads={leads} onSelect={setSelected} selectedId={selected?.id} />
+      <LeadTable
+        leads={leads}
+        onSelect={setSelected}
+        selectedId={selected?.id}
+        onDelete={(id) => {
+          if (selected?.id === id) setSelected(null);
+          onUpdateLead(id, { _deleted: true });
+        }}
+      />
 
       {/* ── Lead detail ── */}
       {selected && (

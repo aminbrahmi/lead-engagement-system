@@ -20,6 +20,16 @@ UNKNOWNS = [
     "Mistral AI | CTO | Paris",
     "Instadeep | CEO | Tunis",
     "Talan | CEO | Tunis",
+    "ClusterLab | CEO | Tunisia",
+    "AmalXR | CEO | Tunisia",
+    "Swiver | CEO | Tunisia",
+    "iCompass | CEO | Tunisia",
+    "WildyNess | CEO | Tunisia",
+    "med.tn | CEO | Tunisia",
+    "ENOVA Robotics | CEO | Tunisia",
+    "North Business Angels | CEO | Tunisia",
+    "PAYDAY | CEO | Tunisia",
+    
 ]
 
 print("\n" + "="*60)

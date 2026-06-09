@@ -38,9 +38,9 @@ from memory.storage import (
     save_enrichment_results, update_lead_qualification,
     get_all_campaigns, get_campaign_by_prompt, _generate_campaign_id, get_conn,
     get_campaign_events, log_campaign_event, update_campaign_status,
-    get_exclusion_list, add_exclusion, remove_exclusion,
+    get_exclusion_list, add_exclusion, remove_exclusion, remove_exclusion_by_value,
     get_sender_config, save_sender_config, update_sender_config,
-    find_similar_campaign, save_campaign_criteria,
+    find_similar_campaign, save_campaign_criteria, delete_lead_completely,
 )
 from orchestration.graph import build_pipeline, LeadPipelineState
 from utils.json_utils import extract_json_list
@@ -58,6 +58,10 @@ app.add_middleware(
 )
 
 init_db()
+
+# Base URL used in customer-facing links (unsubscribe / resubscribe).
+# Must match the host the recipient can reach — same value the sender uses.
+BASE_URL = os.getenv("REACT_APP_API_URL", "http://localhost:8000")
 
 # ── In-memory campaign store ─────────────────────────────────────────────────
 
@@ -247,6 +251,13 @@ def get_lead(lead_id: str):
                         pass
             return lead
     raise HTTPException(404, "Lead not found")
+
+
+@app.delete("/leads/{lead_id}")
+def delete_lead(lead_id: str):
+    """RGPD Art. 17 — erase all personal data for this lead across every store."""
+    result = delete_lead_completely(lead_id)
+    return {"status": "deleted", "erased": result}
 
 
 @app.patch("/leads/{lead_id}")
@@ -1004,30 +1015,159 @@ def track_open(sequence_id: int, token: str):
     return Response(content=pixel, media_type="image/gif")
 
 
+def _unsub_page(title: str, message: str, lead_id: str = None,
+                token: str = None, action: str = None) -> str:
+    """Render a styled unsubscribe/resubscribe confirmation page.
+    action: 'resubscribe' | 'unsubscribe' | None — adds the matching button."""
+    button = ""
+    if action == "resubscribe" and lead_id and token:
+        button = f"""
+        <a href="{BASE_URL}/resubscribe/{lead_id}/{token}" style="
+            display:inline-block;margin-top:24px;padding:12px 28px;
+            background:#6c5ce7;color:#fff;text-decoration:none;border-radius:8px;
+            font-weight:600;font-size:14px">Resubscribe</a>
+        <p style="color:#999;font-size:12px;margin-top:16px">
+            Changed your mind? Click above to start receiving emails again.</p>"""
+    elif action == "unsubscribe" and lead_id and token:
+        button = f"""
+        <a href="{BASE_URL}/unsubscribe/{lead_id}/{token}" style="
+            display:inline-block;margin-top:24px;padding:12px 28px;
+            background:#ff6b6b;color:#fff;text-decoration:none;border-radius:8px;
+            font-weight:600;font-size:14px">Unsubscribe again</a>"""
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{title}</title></head>
+    <body style="font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#f5f6fa;margin:0">
+    <div style="max-width:480px;margin:80px auto;background:#fff;padding:48px 40px;
+        border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.08);text-align:center">
+        <h2 style="color:#2d3436;margin:0 0 12px">{title}</h2>
+        <p style="color:#636e72;font-size:15px;line-height:1.6;margin:0">{message}</p>
+        {button}
+    </div></body></html>"""
+
+
+@app.get("/unsubscribe/{lead_id}/{token}")
+def _do_unsubscribe(lead_id: str) -> None:
+    """Core opt-out logic: cancel sequences, exclude email, mark lead, notify."""
+    from memory.storage import cancel_remaining_sequence
+    from agents.tracker_node import _create_notification
+
+    cancel_remaining_sequence(lead_id)
+
+    lead_name, lead_company, lead_email, campaign_id = "this contact", "", None, None
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name, company, email, campaign FROM leads WHERE id = %s",
+            (lead_id,)
+        )
+        row = cursor.fetchone()
+        if row:
+            lead_name = row[0] or "Unknown"
+            lead_company = row[1] or ""
+            lead_email = row[2]
+            campaign_id = row[3]
+        cursor.execute(
+            "UPDATE leads SET status = 'unsubscribed', updated_at = %s WHERE id = %s",
+            (datetime.now().isoformat(), lead_id)
+        )
+
+    if lead_email:
+        add_exclusion(lead_email, "email", "RGPD unsubscribe")
+
+    who = f"{lead_name}" + (f" @ {lead_company}" if lead_company else "")
+    _create_notification(
+        campaign_id or "", lead_id, "unsubscribe",
+        f"🚫 {who} unsubscribed",
+        {"lead_id": lead_id, "email": lead_email},
+    )
+
+
 @app.get("/unsubscribe/{lead_id}/{token}")
 def unsubscribe(lead_id: str, token: str):
-    """RGPD unsubscribe page."""
-    expected = hashlib.md5(f"unsub-{lead_id}".encode()).hexdigest()[:16]
-    success = token == expected
+    """RGPD unsubscribe page — cancels sequences, excludes email, notifies, offers resubscribe."""
+    from utils.tokens import verify_token
+    if not verify_token(lead_id, token):
+        return HTMLResponse(content=_unsub_page(
+            "Invalid link",
+            "This link is invalid or has expired.",
+        ))
 
-    if success:
-        try:
-            from memory.storage import cancel_remaining_sequence, add_exclusion
-            cancel_remaining_sequence(lead_id)
-            with get_conn() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT email, company FROM leads WHERE id = %s", (lead_id,))
-                row = cursor.fetchone()
-                if row and row[0]:
-                    add_exclusion(row[0], "email", "RGPD unsubscribe")
-        except Exception as e:
-            print(f"[Unsub] Error: {e}")
+    try:
+        _do_unsubscribe(lead_id)
+    except Exception as e:
+        print(f"[Unsub] Error: {e}")
 
-    html = f"""<html><body style="font-family:Arial;max-width:500px;margin:60px auto;text-align:center">
-    <h2>{"You have been unsubscribed" if success else "Invalid link"}</h2>
-    <p style="color:#666">{"You will no longer receive emails from us." if success else "This link is invalid or expired."}</p>
-    </body></html>"""
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=_unsub_page(
+        "You have been unsubscribed",
+        "You will no longer receive emails from us.",
+        lead_id=lead_id, token=token, action="resubscribe",
+    ))
+
+
+@app.post("/unsubscribe/{lead_id}/{token}")
+def unsubscribe_one_click(lead_id: str, token: str):
+    """RFC 8058 one-click unsubscribe — called by the mail client (Gmail/Outlook)."""
+    from utils.tokens import verify_token
+    if not verify_token(lead_id, token):
+        raise HTTPException(status_code=400, detail="Invalid token")
+    try:
+        _do_unsubscribe(lead_id)
+    except Exception as e:
+        print(f"[Unsub] One-click error: {e}")
+    return {"status": "unsubscribed"}
+
+
+@app.get("/resubscribe/{lead_id}/{token}")
+def resubscribe(lead_id: str, token: str):
+    """Re-enable emails for a lead that previously unsubscribed."""
+    from utils.tokens import verify_token
+    if not verify_token(lead_id, token):
+        return HTMLResponse(content=_unsub_page(
+            "Invalid link",
+            "This link is invalid or has expired.",
+        ))
+
+    lead_name, lead_company, lead_email, campaign_id = "this contact", "", None, None
+    try:
+        from agents.tracker_node import _create_notification
+
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, company, email, campaign FROM leads WHERE id = %s",
+                (lead_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                lead_name = row[0] or "Unknown"
+                lead_company = row[1] or ""
+                lead_email = row[2]
+                campaign_id = row[3]
+            # Restore lead status
+            cursor.execute(
+                "UPDATE leads SET status = 'enriched', updated_at = %s WHERE id = %s",
+                (datetime.now().isoformat(), lead_id)
+            )
+
+        if lead_email:
+            remove_exclusion_by_value(lead_email, "email")
+
+        who = f"{lead_name}" + (f" @ {lead_company}" if lead_company else "")
+        _create_notification(
+            campaign_id or "", lead_id, "resubscribe",
+            f"✅ {who} resubscribed",
+            {"lead_id": lead_id, "email": lead_email},
+        )
+    except Exception as e:
+        print(f"[Resub] Error: {e}")
+
+    return HTMLResponse(content=_unsub_page(
+        "You're resubscribed",
+        "Welcome back! You will receive our emails again.",
+        lead_id=lead_id, token=token, action="unsubscribe",
+    ))
 
 @app.get("/track/click/{sequence_id}")
 def track_click(sequence_id: int, url: str = ""):

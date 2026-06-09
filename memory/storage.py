@@ -195,6 +195,16 @@ def init_db():
         _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_notif_lead ON notifications(lead_id)")
         _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_notif_read ON notifications(read)")
 
+        # ── RGPD migration: cascade lead deletion to child rows (Art. 17) ─────
+        # Without ON DELETE CASCADE, deleting a contacted lead fails on FK and
+        # leaves personal data behind. Recreate the FKs with CASCADE.
+        _safe_index(cursor, "ALTER TABLE email_sequences DROP CONSTRAINT IF EXISTS email_sequences_lead_id_fkey")
+        _safe_index(cursor, "ALTER TABLE email_sequences ADD CONSTRAINT email_sequences_lead_id_fkey "
+                            "FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE")
+        _safe_index(cursor, "ALTER TABLE discussions DROP CONSTRAINT IF EXISTS discussions_lead_id_fkey")
+        _safe_index(cursor, "ALTER TABLE discussions ADD CONSTRAINT discussions_lead_id_fkey "
+                            "FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE")
+
         # ── Migrations: ajouter colonnes manquantes ──────────────────────────
 
         cursor.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ")
@@ -804,14 +814,38 @@ def find_similar_campaign(criteria: dict) -> dict | None:
 # ── Exclusion list ───────────────────────────────────────────────────────────
 
 def add_exclusion(value: str, exc_type: str, reason: str = None):
-    """Add a company or domain to the exclusion list.
+    """Add a company or domain to the exclusion list (idempotent).
     exc_type: 'company' | 'domain' | 'email'
     """
+    val = value.lower().strip()
     with get_conn() as conn:
-        conn.cursor().execute("""
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM exclusion_list WHERE type = %s AND value = %s",
+            (exc_type, val)
+        )
+        if cursor.fetchone():
+            return  # already excluded — don't duplicate
+        cursor.execute("""
             INSERT INTO exclusion_list (value, type, reason)
             VALUES (%s, %s, %s)
-        """, (value.lower().strip(), exc_type, reason))
+        """, (val, exc_type, reason))
+
+
+def remove_exclusion_by_value(value: str, exc_type: str = None) -> int:
+    """Remove all exclusion rows matching a value (optionally typed).
+    Returns number of rows deleted."""
+    val = value.lower().strip()
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        if exc_type:
+            cursor.execute(
+                "DELETE FROM exclusion_list WHERE value = %s AND type = %s",
+                (val, exc_type)
+            )
+        else:
+            cursor.execute("DELETE FROM exclusion_list WHERE value = %s", (val,))
+        return cursor.rowcount
 
 
 def get_exclusion_list() -> list:
@@ -850,6 +884,67 @@ def is_excluded(company: str = None, domain: str = None, email: str = None) -> b
             if cursor.fetchone():
                 return True
     return False
+
+
+# ── RGPD: complete erasure (Art. 17 — right to be forgotten) ─────────────────
+
+def delete_lead_completely(lead_id: str) -> dict:
+    """Erase every trace of a lead's personal data across all stores:
+    PostgreSQL (lead + sequences + discussions + messages + notifications),
+    the JSON snapshot, and the ChromaDB vector store.
+
+    Returns a summary of what was removed.
+    """
+    result = {"db": 0, "json": 0, "chroma": False, "name": None, "company": None}
+
+    # ── 1. PostgreSQL — delete child rows first, then the lead ──
+    try:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, company FROM leads WHERE id = %s", (lead_id,))
+            row = cursor.fetchone()
+            if row:
+                result["name"], result["company"] = row[0], row[1]
+
+            # Child tables with a plain lead_id column (no/partial FK cascade)
+            for tbl in ("messages", "email_sequences", "lead_notifications", "notifications"):
+                try:
+                    cursor.execute(f"DELETE FROM {tbl} WHERE lead_id = %s", (lead_id,))
+                except Exception as e:
+                    print(f"[Erase] {tbl} cleanup skipped: {e}")
+            cursor.execute("DELETE FROM discussions WHERE lead_id = %s", (lead_id,))
+            cursor.execute("DELETE FROM leads WHERE id = %s", (lead_id,))
+            result["db"] = cursor.rowcount
+    except Exception as e:
+        print(f"[Erase] PostgreSQL error: {e}")
+
+    # ── 2. JSON snapshot ──
+    try:
+        if os.path.exists(JSON_PATH):
+            with open(JSON_PATH, "r", encoding="utf-8") as f:
+                entries = json.load(f)
+            kept = [
+                e for e in entries
+                if _generate_id(e.get("name", "unknown"), e.get("company", "unknown")) != lead_id
+            ]
+            result["json"] = len(entries) - len(kept)
+            with open(JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(kept, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[Erase] JSON error: {e}")
+
+    # ── 3. ChromaDB ──
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=os.path.join(DATA_DIR, "chroma"))
+        collection = client.get_or_create_collection("leads")
+        collection.delete(ids=[lead_id])
+        result["chroma"] = True
+    except Exception as e:
+        print(f"[Erase] ChromaDB error: {e}")
+
+    print(f"[Erase] Lead {lead_id} erased — db={result['db']} json={result['json']} chroma={result['chroma']}")
+    return result
 
 
 # ── Sender config ────────────────────────────────────────────────────────────

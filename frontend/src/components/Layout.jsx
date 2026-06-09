@@ -23,6 +23,7 @@ const TYPE_ICON = {
   email_bounced:      "\u26A0\uFE0F",
   email_opened:       "\uD83D\uDC41",
   unsubscribe:        "\uD83D\uDEAB",
+  resubscribe:        "\u2705",
   calendar_accepted:  "\uD83D\uDCC5\u2705",
   calendar_declined:  "\uD83D\uDCC5\u274C",
   calendar_response:  "\uD83D\uDCC5",
@@ -215,11 +216,12 @@ function NotificationBell() {
 }
 
 const NAV = [
-  { to: "/",          label: "Campaign" },
-  { to: "/pipeline",  label: "Pipeline" },
-  { to: "/leads",     label: "Leads" },
-  { to: "/inbox",     label: "Inbox" },
-  { to: "/analytics", label: "Analytics" },
+  { to: "/",           label: "Campaign" },
+  { to: "/pipeline",   label: "Pipeline" },
+  { to: "/leads",      label: "Leads" },
+  { to: "/inbox",      label: "Inbox" },
+  { to: "/analytics",  label: "Analytics" },
+  { to: "/exclusions", label: "Exclusions" },
 ];
 
 function ThemeToggle() {

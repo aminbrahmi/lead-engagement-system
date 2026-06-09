@@ -174,6 +174,7 @@ def _enrich_one(lead: dict, api_key: str) -> dict:
     else:
         lead["insights_quality"] = "ok"
         print(f"[Enricher] ✓ Done: {company}")
+
     return lead
 
 

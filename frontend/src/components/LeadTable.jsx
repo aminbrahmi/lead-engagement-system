@@ -4,11 +4,68 @@ import { useTheme } from "../App";
 import { segmentColor } from "../styles/theme";
 import Badge from "./ui/Badge";
 
-export default function LeadTable({ leads, onSelect, selectedId }) {
+const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
+
+function ConfirmModal({ lead, onConfirm, onCancel, theme }) {
+  const c = theme.colors;
+  const f = theme.fonts;
+  return (
+    <div style={{
+      position: "fixed", inset: 0, zIndex: 1000,
+      background: "rgba(0,0,0,0.45)", display: "flex",
+      alignItems: "center", justifyContent: "center",
+    }}
+      onClick={onCancel}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: c.surface, border: `1px solid ${c.border}`,
+          borderRadius: 14, padding: "28px 32px", width: 360,
+          boxShadow: "0 16px 48px rgba(0,0,0,0.3)",
+        }}
+      >
+        <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>🗑</div>
+        <p style={{ fontSize: 15, fontWeight: 600, color: c.text, textAlign: "center", marginBottom: 6 }}>
+          Delete lead?
+        </p>
+        <p style={{ fontSize: 13, color: c.textMuted, textAlign: "center", marginBottom: 24, lineHeight: 1.5 }}>
+          <strong style={{ color: c.text }}>{lead.name && lead.name !== "unknown" ? lead.name : lead.company}</strong>
+          {" "}will be permanently removed.
+        </p>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button
+            onClick={onCancel}
+            style={{
+              flex: 1, padding: "9px 0", borderRadius: 8,
+              border: `1px solid ${c.border}`, background: "transparent",
+              color: c.textMuted, fontSize: 13, cursor: "pointer", fontFamily: f.body, fontWeight: 500,
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            style={{
+              flex: 1, padding: "9px 0", borderRadius: 8,
+              border: "none", background: "#ff6b6b",
+              color: "#fff", fontSize: 13, cursor: "pointer", fontFamily: f.body, fontWeight: 600,
+            }}
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function LeadTable({ leads, onSelect, selectedId, onDelete }) {
   const { theme } = useTheme();
   const c = theme.colors;
   const f = theme.fonts;
   const [filter, setFilter] = useState("all");
+  const [pendingDelete, setPendingDelete] = useState(null);
   const filtered = filter === "all" ? leads : leads.filter((l) => l.segment === filter);
   const counts = {
     all: leads.length,
@@ -17,7 +74,25 @@ export default function LeadTable({ leads, onSelect, selectedId }) {
     cold: leads.filter((l) => l.segment === "cold").length,
   };
 
+  const handleDeleteConfirmed = async () => {
+    const lead = pendingDelete;
+    setPendingDelete(null);
+    try {
+      await fetch(`${API}/leads/${lead.id}`, { method: "DELETE" });
+      onDelete?.(lead.id);
+    } catch {}
+  };
+
   return (
+    <>
+    {pendingDelete && (
+      <ConfirmModal
+        lead={pendingDelete}
+        theme={theme}
+        onConfirm={handleDeleteConfirmed}
+        onCancel={() => setPendingDelete(null)}
+      />
+    )}
     <div style={{ background: c.surface, border: `1px solid ${c.border}`, borderRadius: 14, overflow: "hidden" }}>
       <div style={{
         padding: "16px 24px", borderBottom: `1px solid ${c.border}`,
@@ -42,7 +117,7 @@ export default function LeadTable({ leads, onSelect, selectedId }) {
           <thead>
             <tr style={{ borderBottom: `1px solid ${c.border}` }}>
               {/* Removed email verification column */}
-              {["Name", "Company", "Role", "Score", "Segment", "Email", "Emails", "Status"].map((h) => (
+              {["Name", "Company", "Role", "Score", "Segment", "Email", "Emails", "Status", ""].map((h) => (
                 <th key={h} style={{
                   padding: "10px 16px", textAlign: "left", fontSize: 10,
                   color: c.textDim, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase",
@@ -107,6 +182,29 @@ export default function LeadTable({ leads, onSelect, selectedId }) {
                       color: lead.status === "enriched" ? c.green : c.textMuted,
                     }}>{lead.status}</span>
                   </td>
+                  <td style={{ padding: "8px 12px" }} onClick={(e) => e.stopPropagation()}>
+                    <button
+                      onClick={() => setPendingDelete(lead)}
+                      style={{
+                        background: "none", border: `1px solid transparent`, borderRadius: 6,
+                        cursor: "pointer", color: c.textDim, fontSize: 14, padding: "4px 7px",
+                        transition: "all .15s", lineHeight: 1,
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.color = "#ff6b6b";
+                        e.currentTarget.style.borderColor = "#ff6b6b33";
+                        e.currentTarget.style.background = "#ff6b6b11";
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.color = c.textDim;
+                        e.currentTarget.style.borderColor = "transparent";
+                        e.currentTarget.style.background = "none";
+                      }}
+                      title="Delete lead"
+                    >
+                      🗑
+                    </button>
+                  </td>
                 </tr>
               );
             })}
@@ -119,5 +217,6 @@ export default function LeadTable({ leads, onSelect, selectedId }) {
         )}
       </div>
     </div>
+    </>
   );
 }

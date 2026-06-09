@@ -204,14 +204,34 @@ def _build_mime_message(sender_config, to_email, subject, body,
     if signature and signature not in full_body:
         full_body = full_body + "\n\n" + signature
 
-    # Unsubscribe link (RGPD)
-    unsub_token = hashlib.md5(f"unsub-{lead_id}".encode()).hexdigest()[:16] if lead_id else ""
-    unsub_url = f"{BASE_URL}/unsubscribe/{lead_id}/{unsub_token}" if lead_id else ""
+    # Unsubscribe link (RGPD) — signed token (HMAC), not a guessable hash
+    unsub_url = ""
+    if lead_id:
+        from utils.tokens import make_token
+        unsub_token = make_token(lead_id)
+        unsub_url = f"{BASE_URL}/unsubscribe/{lead_id}/{unsub_token}"
+
+        # RFC 8058 one-click unsubscribe — expected by Gmail/Outlook bulk senders
+        sender_email = sender_config.get("email", "")
+        list_unsub = f"<{unsub_url}>"
+        if sender_email:
+            list_unsub += f", <mailto:{sender_email}?subject=unsubscribe>"
+        msg["List-Unsubscribe"] = list_unsub
+        msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+
+    # RGPD transparency notice (Art. 14): data origin + rights + opt-out
+    sender_company = sender_config.get("company", "us")
+    privacy_text = (
+        f"You are receiving this email because we identified your professional "
+        f"profile as potentially relevant to {sender_company}. Your business contact "
+        f"details were obtained from publicly available sources. We process them on "
+        f"the basis of legitimate interest. You can object at any time:"
+    )
 
     # Plain text (no tracking possible)
     plain = full_body
     if unsub_url:
-        plain += f"\n\nUnsubscribe: {unsub_url}"
+        plain += f"\n\n---\n{privacy_text}\nUnsubscribe: {unsub_url}"
     msg.attach(MIMEText(plain, "plain", "utf-8"))
 
     # HTML version with tracking
@@ -248,10 +268,16 @@ def _build_mime_message(sender_config, to_email, subject, body,
         pixel_token = hashlib.md5(f"open-{sequence_id}".encode()).hexdigest()[:16]
         pixel_html = f'<img src="{BASE_URL}/track/open/{sequence_id}/{pixel_token}" width="1" height="1" style="display:none" />'
 
-    # Unsubscribe footer
+    # Unsubscribe + RGPD transparency footer
     unsub_html = ""
     if unsub_url:
-        unsub_html = f'<p style="font-size:11px;color:#999;margin-top:30px;border-top:1px solid #eee;padding-top:10px"><a href="{unsub_url}" style="color:#999">Unsubscribe</a></p>'
+        unsub_html = (
+            '<div style="font-size:11px;color:#999;margin-top:30px;'
+            'border-top:1px solid #eee;padding-top:10px;line-height:1.5">'
+            f'<p style="margin:0 0 6px">{privacy_text}</p>'
+            f'<a href="{unsub_url}" style="color:#999;text-decoration:underline">Unsubscribe</a>'
+            '</div>'
+        )
 
     html = f"""<html><body style="font-family:Arial,sans-serif;font-size:14px;color:#1a1a2e;line-height:1.7">
     <p>{html_body}</p>

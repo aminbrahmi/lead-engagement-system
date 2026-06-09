@@ -67,7 +67,7 @@ def _enrich_name(lead: dict) -> dict:
         if result.startswith("Found: "):
             lead = dict(lead)
             lead["name"] = result[7:].strip()
-            print(f"[Qualifier] ✓ Name found: {lead['name']} @ {lead.get('company')}")
+            print(f"[Qualifier] OK Name found: {lead['name']} @ {lead.get('company')}")
     except Exception as exc:
         print(f"[Qualifier] Name enrichment failed for {lead.get('company')}: {exc}")
 
@@ -120,13 +120,13 @@ def _find_email(lead: dict) -> dict:
             lead["email_source"] = data.get("source")
             lead["email_conf"]   = data.get("confidence", 0)
 
-            # ✅ VERIFIED LOGIC
+            # ✅ VERIFIED LOGIC — email_finder returns {"status": "verified"/"unverified"}
             lead["email_verified"] = (
-                data.get("verified") is True
+                data.get("status") == "verified"
                 or is_auto_verified(lead["email_source"])
             )
 
-            print(f"[Qualifier] ✓ Email found: {email} ({data.get('source')}) @ {company}")
+            print(f"[Qualifier] OK Email found: {email} ({data.get('source')}) @ {company}")
 
     except Exception as exc:
         print(f"[Qualifier] Email finding failed for {company}: {exc}")

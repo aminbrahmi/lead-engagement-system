@@ -7,8 +7,10 @@ import PipelinePage from "./pages/PipelinePage";
 import LeadsPage from "./pages/LeadsPage";
 import AnalyticsPage from "./pages/AnalyticsPage";
 import InboxPage from "./pages/InboxPage";
+import ExclusionsPage from "./pages/ExclusionsPage";
 import usePipeline from "./hooks/usePipeline";
 import useCampaigns from "./hooks/useCampaigns";
+import { getLeads } from "./api/leads";
 import { darkTheme, lightTheme } from "./styles/theme";
 import "./styles/global.css";
 
@@ -55,7 +57,11 @@ function AppRoutes() {
 
   const handleUpdateLead = useCallback(
     (leadId, updates) => {
-      setLeads((prev) => prev.map((l) => (l.id === leadId ? { ...l, ...updates } : l)));
+      if (updates._deleted) {
+        setLeads((prev) => prev.filter((l) => l.id !== leadId));
+      } else {
+        setLeads((prev) => prev.map((l) => (l.id === leadId ? { ...l, ...updates } : l)));
+      }
     },
     [setLeads]
   );
@@ -64,14 +70,28 @@ function AppRoutes() {
     ? campaigns.find((c) => c.id === activeCampaignId)
     : null;
 
+  const handleRefresh = useCallback(async () => {
+    if (activeCampaignId) {
+      const fresh = await loadCampaignLeads(activeCampaignId);
+      setLeads(fresh);
+    } else {
+      try {
+        const data = await getLeads();
+        setLeads(data.leads || []);
+      } catch {}
+    }
+    fetchCampaigns();
+  }, [activeCampaignId, loadCampaignLeads, setLeads, fetchCampaigns]);
+
   return (
     <Routes>
       <Route element={<Layout isRunning={isRunning} leadsCount={leads.length} />}>
         <Route index element={<CampaignPage onLaunch={handleLaunch} onViewCampaign={handleViewCampaign} isRunning={isRunning} campaigns={campaigns} campaignsLoading={campaignsLoading} />} />
         <Route path="pipeline" element={<PipelinePage currentStage={currentStage} logs={logs} isRunning={isRunning} />} />
-        <Route path="leads" element={<LeadsPage leads={leads} onUpdateLead={handleUpdateLead} activeCampaign={activeCampaign} campaigns={campaigns} onViewCampaign={handleViewCampaign} />} />
+        <Route path="leads" element={<LeadsPage leads={leads} onUpdateLead={handleUpdateLead} activeCampaign={activeCampaign} campaigns={campaigns} onViewCampaign={handleViewCampaign} onRefresh={handleRefresh} />} />
         <Route path="inbox" element={<InboxPage />} />
         <Route path="analytics" element={<AnalyticsPage leads={leads} />} />
+        <Route path="exclusions" element={<ExclusionsPage />} />
       </Route>
     </Routes>
   );

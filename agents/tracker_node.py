@@ -597,9 +597,10 @@ def generate_click_url(sequence_id: int, target_url: str, base_url: str = "") ->
 
 
 def generate_unsubscribe_url(lead_id: str, base_url: str = "") -> str:
-    """Generate RGPD-compliant unsubscribe link."""
+    """Generate RGPD-compliant unsubscribe link with a signed (HMAC) token."""
+    from utils.tokens import make_token
     base = base_url or os.getenv("REACT_APP_API_URL", "http://localhost:8000")
-    token = hashlib.md5(f"unsub-{lead_id}".encode()).hexdigest()[:16]
+    token = make_token(lead_id)
     return f"{base}/unsubscribe/{lead_id}/{token}"
 
 
@@ -969,8 +970,8 @@ def mark_all_notifications_read():
 
 def handle_unsubscribe(lead_id: str, token: str) -> bool:
     """Process RGPD unsubscribe request."""
-    expected_token = hashlib.md5(f"unsub-{lead_id}".encode()).hexdigest()[:16]
-    if token != expected_token:
+    from utils.tokens import verify_token
+    if not verify_token(lead_id, token):
         return False
 
     from memory.storage import get_conn, cancel_remaining_sequence, add_exclusion
