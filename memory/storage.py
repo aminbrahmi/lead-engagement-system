@@ -221,6 +221,9 @@ def init_db():
         cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ")
         cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS clicked_at TIMESTAMPTZ")
         cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS recipient_email TEXT")
+        # Engagement intensity: total open/click events (incremented on every hit)
+        cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS open_count INTEGER DEFAULT 0")
+        cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS click_count INTEGER DEFAULT 0")
 
         cursor.execute("""
             UPDATE email_sequences
@@ -612,7 +615,9 @@ def save_enrichment_results(enriched_leads: list) -> int:
         cursor = conn.cursor()
 
         for lead in enriched_leads:
-            lead_id = _generate_id(
+            # Prefer the lead's existing id — recomputing from name+company breaks
+            # when the company was enriched/changed (the row id stays the original).
+            lead_id = lead.get("id") or _generate_id(
                 lead.get("name", "unknown"),
                 lead.get("company", "unknown")
             )
@@ -1098,20 +1103,18 @@ def update_sequence_status(sequence_id: int, status: str,
 
     with get_conn() as conn:
         cursor = conn.cursor()
-        if recipient_email:
-            cursor.execute("""
-                UPDATE email_sequences
-                SET status = %s, sent_at = %s, message_id = %s, error_message = %s,
-                    recipient_email = %s
-                WHERE id = %s
-            """, (status, now if status == 'sent' else None, message_id, error_message,
-                  recipient_email, sequence_id))
-        else:
-            cursor.execute("""
-                UPDATE email_sequences
-                SET status = %s, sent_at = %s, message_id = %s, error_message = %s
-                WHERE id = %s
-            """, (status, now if status == 'sent' else None, message_id, error_message, sequence_id))
+        # Preserve sent_at / message_id / recipient_email on status transitions
+        # (e.g. 'sent' → 'replied') so we never lose the "was sent" evidence.
+        cursor.execute("""
+            UPDATE email_sequences
+            SET status          = %s,
+                sent_at         = CASE WHEN %s = 'sent' THEN %s ELSE sent_at END,
+                message_id      = COALESCE(%s, message_id),
+                error_message   = %s,
+                recipient_email = COALESCE(%s, recipient_email)
+            WHERE id = %s
+        """, (status, status, now, message_id, error_message,
+              recipient_email, sequence_id))
 
 
 def cancel_remaining_sequence(lead_id: str, reason: str = "Lead replied"):

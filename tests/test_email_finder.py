@@ -13,16 +13,9 @@ from tools.email_finder import EmailFinderTool
 
 # Test cases — real leads from our Berlin campaign
 TEST_LEADS = [
-    {"name": "Florian Wenzel",     "domain": "mirelo.ai"},
-    {"name": "Vasilije Markovic",  "domain": "cognee.ai"},
-    {"name": "Adam Bahlke",        "domain": "motorai.de"},
-    {"name": "Anna Mayer",         "domain": "deepscale.com"},
-    {"name": "Thomas Schreiber",   "domain": "neurotech.com"},
-    {"name": "Alexander Matthey",  "domain": "parloa.com"},
-    {"name": "Tobias Siwonia",     "domain": "peec.ai"},
-    {"name": "Brad Heller",        "domain": "tower.com"},
-    {"name": "Onur Eken",          "domain": "needle.com"},
-    {"name": "Boris Arzentar",     "domain": "Cognee.ai"},
+    {"name": "Stephen Marks",     "domain": "French Connection"},
+    {"name": "Sharon French",  "domain": "FULLBEAUTY Brands"},
+    {"name": "Laurence Paganini",        "domain": "Kaporal"},
 ]
 
 tool = EmailFinderTool()

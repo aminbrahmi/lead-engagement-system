@@ -260,8 +260,10 @@ def _generate_one(lead: dict, campaign_prompt: str, sender_info: dict) -> dict:
     name = lead.get("name", "")
     company = lead.get("company", "")
 
-    # Skip cold leads or missing insights
-    if lead.get("segment") == "cold" or not lead.get("insights"):
+    # Generate whenever we have insights — drafting is independent of the segment.
+    # (A cold/unverified lead still gets a draft ready; whether it is *sent* is
+    #  decided elsewhere by the email-reliability rules.)
+    if not lead.get("insights"):
         return lead
 
     # Skip if ALL insight values are empty/N/A

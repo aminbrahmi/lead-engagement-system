@@ -90,15 +90,15 @@ class EmailFinderTool(BaseTool):
             print(f"[EmailFinder]  Apollo   → {email}")
 
         # ── 4. Tavily / Google search ─────────────────────────────────────────
-        emails = self._tavily(session, name, domain, company)
-        for e in emails:
-            candidates.append({"email": e, "confidence": 70, "source": "google"})
+        for e in self._tavily(session, name, domain, company):
+            candidates.append({"email": e, "source": "google",
+                               "confidence": self._confidence(e, domain, name, 70)})
             print(f"[EmailFinder]  Tavily   → {e}")
 
         # ── 5. Website scraping ───────────────────────────────────────────────
-        emails = self._scrape(domain)
-        for e in emails:
-            candidates.append({"email": e, "confidence": 60, "source": "scraping"})
+        for e in self._scrape(domain):
+            candidates.append({"email": e, "source": "scraping",
+                               "confidence": self._confidence(e, domain, name, 60)})
             print(f"[EmailFinder]  Scrape   → {e}")
 
         # ── 6. Pattern generation ─────────────────────────────────────────────
@@ -107,6 +107,12 @@ class EmailFinderTool(BaseTool):
             candidates.append({"email": e, "confidence": 35, "source": "pattern"})
         if patterns:
             print(f"[EmailFinder]  Patterns → {patterns}")
+
+        # ── 7. Generic company mailboxes (last resort) ────────────────────────
+        if domain and domain not in _JUNK_DOMAINS:
+            for g in ("contact", "info", "hello", "sales"):
+                candidates.append({"email": f"{g}@{domain}",
+                                   "confidence": 40, "source": "generic"})
 
         # ── Deduplicate, filter junk ──────────────────────────────────────────
         seen       = set()
@@ -157,7 +163,10 @@ class EmailFinderTool(BaseTool):
 
     def _resolve_company_domain(self, company: str) -> str:
         """Try common TLDs via DNS; return first that resolves."""
-        slug = re.sub(r'[^a-z0-9]', '', company.lower().split()[0]) if company else ""
+        comp = (company or "").lower().strip()
+        if comp in ("", "unknown", "n/a", "none", "null"):
+            return ""   # no real company → never fabricate a domain
+        slug = re.sub(r'[^a-z0-9]', '', comp.split()[0]) if comp else ""
         if not slug:
             return ""
         for tld in [".ai", ".io", ".com", ".de", ".co", ".tech"]:
@@ -288,8 +297,9 @@ class EmailFinderTool(BaseTool):
                                    for r in resp.json().get("results", []))
                 for e in re.findall(EMAIL_RE, content):
                     d = e.split("@")[-1].lower()
-                    if d == domain and e not in found:
-                        found.append(e)
+                    # Keep any non-junk email (even cross-domain) — SMTP decides
+                    if d not in _JUNK_DOMAINS and e.lower() not in found:
+                        found.append(e.lower())
             except Exception:
                 continue
         return found
@@ -308,11 +318,26 @@ class EmailFinderTool(BaseTool):
                                     headers=headers, timeout=10)
                 for e in re.findall(EMAIL_RE, resp.text):
                     d = e.split("@")[-1].lower()
-                    if d == domain and e not in found:
-                        found.append(e)
+                    if d not in _JUNK_DOMAINS and e.lower() not in found:
+                        found.append(e.lower())
             except Exception:
                 continue
         return found
+
+    # ── Confidence scoring for found emails ───────────────────────────────────
+
+    def _confidence(self, email: str, domain: str, name: str, base: int) -> int:
+        """Adjust confidence: same domain + name match = higher; cross-domain = lower."""
+        local = email.split("@")[0].lower()
+        edom  = email.split("@")[-1].lower()
+        conf  = base
+        if domain and edom != domain:
+            conf -= 25          # cross-domain → less trustworthy unless verified
+        if name:
+            parts = [p for p in re.split(r"\s+", name.lower()) if len(p) > 1]
+            if any(p in local for p in parts):
+                conf += 10      # local part contains the person's name
+        return max(10, min(conf, 95))
 
     # ── Source 6: Pattern generation ─────────────────────────────────────────
 

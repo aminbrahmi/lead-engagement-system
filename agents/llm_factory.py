@@ -168,3 +168,14 @@ def get_writer_llm() -> BaseChatModel:
         openrouter_model = "meta-llama/llama-3.3-70b-instruct",
         max_tokens     = 4096,
     )
+
+
+def get_analyst_llm() -> BaseChatModel:
+    """LLM used by the Analyst agent to write optimization recommendations."""
+    return _build_chain(
+        groq_models    = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b"],
+        gemini_model   = "gemini-1.5-pro",
+        together_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        openrouter_model = "openai/gpt-4o-mini",
+        max_tokens     = 2048,
+    )

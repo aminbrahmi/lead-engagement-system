@@ -21,3 +21,8 @@ export const updateLeadStatus = (id, status) =>
 
 export const updateLeadFields = (id, fields) =>
   client.patch(`/leads/${id}/fields`, fields);
+
+// Re-run research insights, regenerate A/B emails, and auto-adjust the score.
+// Longer timeout: this does Tavily searches + LLM calls + SMTP verification.
+export const reEnrichLead = (id) =>
+  client.post(`/leads/${id}/re-enrich`, {}, { timeout: 100000 });

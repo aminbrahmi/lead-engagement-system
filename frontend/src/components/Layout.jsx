@@ -21,7 +21,6 @@ const TYPE_ICON = {
   reply_info_request: "\uD83D\uDCAC",
   reply_ooo:          "\uD83C\uDFD6\uFE0F",
   email_bounced:      "\u26A0\uFE0F",
-  email_opened:       "\uD83D\uDC41",
   unsubscribe:        "\uD83D\uDEAB",
   resubscribe:        "\u2705",
   calendar_accepted:  "\uD83D\uDCC5\u2705",
@@ -270,7 +269,10 @@ export default function Layout({ isRunning, leadsCount }) {
       }}>
         {/* Logo */}
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <img src={logo} alt="TheLeadFlow" style={{ height: 32, width: "auto" }} />
+          <img src={logo} alt="TheLeadFlow" style={{ height: 32, width: "auto", borderRadius: 8 }} />
+          <span style={{ fontSize: 18, fontWeight: 700, color: c.text, fontFamily: f.body, letterSpacing: -0.3 }}>
+            TheLeadFlow
+          </span>
         </div>
 
         {/* Nav */}

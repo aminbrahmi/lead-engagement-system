@@ -4,6 +4,7 @@ import { useTheme } from "../App";
 import { segmentColor } from "../styles/theme";
 import Badge from "./ui/Badge";
 import EmailEditor from "./EmailEditor";
+import { reEnrichLead } from "../api/leads";
 
 export default function LeadDetail({ lead, campaignId, onClose, onUpdateEmail, onUpdateLead }) {
   const { theme } = useTheme();
@@ -11,8 +12,41 @@ export default function LeadDetail({ lead, campaignId, onClose, onUpdateEmail, o
   const f = theme.fonts;
   const [editMode, setEditMode] = useState(false);
   const [editFields, setEditFields] = useState({});
+  const [reEnriching, setReEnriching] = useState(false);
+  const [reEnrichMsg, setReEnrichMsg] = useState(null);
+  // Bumped after a successful re-enrich to force the EmailEditor to remount
+  // with the freshly regenerated A/B drafts.
+  const [reEnrichVersion, setReEnrichVersion] = useState(0);
 
   if (!lead) return null;
+
+  const handleReEnrich = async () => {
+    setReEnriching(true);
+    setReEnrichMsg(null);
+    try {
+      const res = await reEnrichLead(lead.id);
+      const fresh = res.lead || {};
+      // Parse draft_emails if the API returned it as a JSON string
+      let de = fresh.draft_emails;
+      if (typeof de === "string") { try { de = JSON.parse(de); } catch {} }
+      // Push the WHOLE refreshed lead back into app state + this panel so the
+      // table row and every field update live, no page refresh needed.
+      onUpdateLead?.(lead.id, { ...fresh, draft_emails: de });
+      setReEnrichVersion((v) => v + 1);
+      const emailPart = fresh.email
+        ? ` · email ${res.email_verified ? "verified ✓" : "not verified ✗"}`
+        : "";
+      setReEnrichMsg(
+        (res.score_changed
+          ? `Updated — new score ${fresh.score} (${fresh.segment})`
+          : "Refreshed — no significant new info found") + emailPart
+      );
+    } catch (e) {
+      setReEnrichMsg("Re-enrichment failed");
+    } finally {
+      setReEnriching(false);
+    }
+  };
 
   const insights = lead.insights || {};
   const insightEntries = Object.entries(insights).filter(
@@ -81,6 +115,21 @@ export default function LeadDetail({ lead, campaignId, onClose, onUpdateEmail, o
             <div style={{ fontFamily: f.mono, fontSize: 28, fontWeight: 700, color: segmentColor(lead.segment, theme) }}>{lead.score}</div>
             <Badge segment={lead.segment} />
           </div>
+          {/* Re-enrich: re-run research, regenerate emails, auto-score */}
+          <button
+            onClick={handleReEnrich}
+            disabled={reEnriching}
+            title="Re-run research insights, regenerate A/B emails, and auto-adjust the score"
+            style={{
+              padding: "5px 10px", borderRadius: 6, border: `1px solid ${c.border}`,
+              background: reEnriching ? c.surfaceAlt : "transparent",
+              color: reEnriching ? c.textDim : c.accent,
+              fontSize: 11, cursor: reEnriching ? "not-allowed" : "pointer", fontFamily: f.mono,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {reEnriching ? "Researching…" : "↻ Re-enrich"}
+          </button>
           {/* Edit toggle for non-cold leads */}
           {!isCold && (
             <button onClick={() => setEditMode(!editMode)} style={{
@@ -92,6 +141,16 @@ export default function LeadDetail({ lead, campaignId, onClose, onUpdateEmail, o
         </div>
       </div>
 
+      {/* Re-enrich status message */}
+      {reEnrichMsg && (
+        <div style={{
+          padding: "8px 14px", borderRadius: 8, marginBottom: 16, fontSize: 12,
+          background: c.accentGlow, color: c.accent, border: `1px solid ${c.accent}22`,
+        }}>
+          {reEnrichMsg}
+        </div>
+      )}
+
       {/* Cold lead banner */}
       {isCold && (
         <div style={{
@@ -99,7 +158,9 @@ export default function LeadDetail({ lead, campaignId, onClose, onUpdateEmail, o
           background: c.warmGlow, color: c.warm, lineHeight: 1.6,
           border: `1px solid ${c.warm}22`,
         }}>
-          This lead is not qualified (no email found). You can manually add an email and insights below to re-qualify and send emails.
+          {lead.email
+            ? `Cold — low campaign-fit score (${lead.score ?? 0}, below the warm threshold of 45). The email is set${lead.email_verified ? " and verified" : ""}; you can edit insights, raise the score, or send manually below.`
+            : "This lead is not qualified (no email found). You can manually add an email and insights below to re-qualify and send emails."}
         </div>
       )}
 
@@ -192,7 +253,7 @@ export default function LeadDetail({ lead, campaignId, onClose, onUpdateEmail, o
       {/* Email editor — only if lead has email */}
       {(lead.email || editFields.email) && (
         <EmailEditor
-          key={lead.id}
+          key={`${lead.id}-${reEnrichVersion}`}
           leadId={lead.id}
           campaignId={campaignId}
           leadEmail={editFields.email || lead.email}

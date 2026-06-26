@@ -262,11 +262,7 @@ def _build_mime_message(sender_config, to_email, subject, body,
             html_body,
         )
 
-    # Open tracking pixel
-    pixel_html = ""
-    if sequence_id:
-        pixel_token = hashlib.md5(f"open-{sequence_id}".encode()).hexdigest()[:16]
-        pixel_html = f'<img src="{BASE_URL}/track/open/{sequence_id}/{pixel_token}" width="1" height="1" style="display:none" />'
+    # (Open tracking pixel removed — open tracking is disabled.)
 
     # Unsubscribe + RGPD transparency footer
     unsub_html = ""
@@ -282,7 +278,6 @@ def _build_mime_message(sender_config, to_email, subject, body,
     html = f"""<html><body style="font-family:Arial,sans-serif;font-size:14px;color:#1a1a2e;line-height:1.7">
     <p>{html_body}</p>
     {unsub_html}
-    {pixel_html}
     </body></html>"""
 
     msg.attach(MIMEText(html, "html", "utf-8"))

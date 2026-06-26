@@ -19,6 +19,14 @@ from typing import Optional
 import threading
 import time
 
+# Make all agent prints (✓, ⚠, emoji…) safe on Windows consoles (cp1252),
+# so an endpoint that runs an agent never crashes on a non-encodable char.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -260,6 +268,208 @@ def delete_lead(lead_id: str):
     return {"status": "deleted", "erased": result}
 
 
+def _apply_segment_rules(lead: dict) -> None:
+    """Enforce the SAME email caps + segment thresholds as the Qualifier:
+      - no email          → score ≤ 20, cold
+      - unverified email  → score ≤ 72, warm (cold if < 45)
+      - verified email    → hot if ≥ 75, warm if 45-74, else cold
+    """
+    has_email = bool(lead.get("email"))
+    verified  = bool(lead.get("email_verified"))
+    score = int(lead.get("score") or 0)
+
+    if not has_email:
+        score = min(score, 20)
+        lead["segment"] = "cold"
+    elif not verified:
+        score = min(score, 72)
+        lead["segment"] = "warm" if score >= 45 else "cold"
+    else:
+        if score >= 75:
+            lead["segment"] = "hot"
+        elif score >= 45:
+            lead["segment"] = "warm"
+        else:
+            lead["segment"] = "cold"
+
+    lead["score"] = score
+
+
+def _rescore_with_qualifier(campaign_prompt: str, lead: dict) -> dict:
+    """Re-score a single lead with the Qualifier's own LLM + prompt, so the
+    score follows the same criteria and the `reason` reads like the original.
+    Then enforce the documented caps/segment deterministically."""
+    from agents.qualifier_node import _scoring_prompt
+    from agents.llm_factory import get_qualifier_llm
+    from orchestration.prompts import QUALIFIER_SYSTEM
+    from utils.json_utils import extract_json_list
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    try:
+        resp = get_qualifier_llm().invoke([
+            SystemMessage(content=QUALIFIER_SYSTEM),
+            HumanMessage(content=_scoring_prompt(campaign_prompt, [lead])),
+        ])
+        content = resp.content
+        if isinstance(content, list):
+            content = "\n".join(
+                b["text"] for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        parsed = extract_json_list(content or "", context="Re-enrich scoring")
+        if parsed:
+            scored = parsed[0]
+            if scored.get("score") is not None:
+                lead["score"] = scored["score"]
+            if scored.get("reason"):
+                lead["reason"] = scored["reason"]
+    except Exception as e:
+        print(f"[Re-enrich] Scoring failed (keeping previous score): {e}")
+
+    _apply_segment_rules(lead)
+    return lead
+
+
+def _is_bogus_email(email: str) -> bool:
+    """A fabricated email built from a junk/unknown company domain — never real."""
+    if not email or "@" not in email:
+        return True
+    domain = email.split("@")[-1].lower()
+    if not domain or "." not in domain:
+        return True
+    bad_exact = {"unknown.ai", "unknown.com", "unknown.io", "example.com",
+                 "example.ai", "test.com", "domain.com", "company.com", "placeholder.com"}
+    if domain in bad_exact:
+        return True
+    return any(tok in domain for tok in ("unknown", "example", "placeholder", "noreply"))
+
+
+@app.post("/leads/{lead_id}/re-enrich")
+def re_enrich_lead(lead_id: str):
+    """Re-run research, regenerate A/B emails, and auto-adjust the score for one lead."""
+    from agents.enricher_node import _enrich_one
+    from agents.writer_node import _generate_one
+
+    # 1. Load the lead
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, name, company, role, location, email, email_source,
+                   email_verified, campaign, insights, score, segment, notes
+            FROM leads WHERE id = %s
+        """, (lead_id,))
+        row = cursor.fetchone()
+    if not row:
+        raise HTTPException(404, "Lead not found")
+
+    cols = ["id", "name", "company", "role", "location", "email", "email_source",
+            "email_verified", "campaign", "insights", "score", "segment", "notes"]
+    lead = dict(zip(cols, row))
+    if isinstance(lead.get("insights"), str):
+        try:
+            lead["insights"] = json.loads(lead["insights"])
+        except Exception:
+            lead["insights"] = {}
+
+    # 2. Resolve the campaign prompt (needed to write on-topic emails)
+    campaign_prompt = ""
+    if lead.get("campaign"):
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT prompt FROM campaigns WHERE id = %s", (lead["campaign"],))
+            crow = cursor.fetchone()
+            if crow:
+                campaign_prompt = crow[0]
+
+    # 2b. Find the company if it's missing/unknown — unlocks domain → email
+    company = (lead.get("company") or "").strip().lower()
+    if company in ("", "unknown", "n/a", "none"):
+        from agents.qualifier_node import find_company
+        lead = find_company(lead)
+
+    # 3. Re-run research
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
+    lead = _enrich_one(lead, tavily_key)
+
+    # 3b. Email: find if missing → verify → if SMTP fails, look for a better email
+    #     (trusted source → auto-verified, otherwise SMTP check)
+    email_message = None
+    try:
+        from agents.qualifier_node import _find_email
+        from utils.email_verifier import verify_email
+
+        # Drop fabricated emails on bogus domains (e.g. built from an unknown company)
+        if lead.get("email") and _is_bogus_email(lead["email"]):
+            print(f"[Re-enrich] Dropping bogus email {lead['email']}")
+            lead["email"] = None
+            lead["email_source"] = None
+            lead["email_verified"] = False
+
+        # Find an email when the lead has none
+        if not lead.get("email"):
+            lead = _find_email(lead)
+
+        if lead.get("email"):
+            verified, email_message = verify_email(lead["email"], lead.get("email_source"))
+            lead["email_verified"] = verified
+            print(f"[Re-enrich] Email {lead['email']}: {email_message}")
+
+            # Fallback: existing email failed verification → search for a better one
+            if not verified:
+                old_email = lead["email"]
+                candidate = _find_email(dict(lead))
+                new_email = candidate.get("email")
+                if new_email and new_email != old_email:
+                    nv, nmsg = verify_email(new_email, candidate.get("email_source"))
+                    if nv:
+                        lead["email"]          = new_email
+                        lead["email_source"]   = candidate.get("email_source")
+                        lead["email_verified"] = True
+                        email_message = f"Replaced unverified email — {nmsg}"
+                        print(f"[Re-enrich] Better email found & verified: {new_email}")
+    except Exception as e:
+        print(f"[Re-enrich] Email step failed: {e}")
+
+    # 4. Re-score with the Qualifier's own rules (same criteria + reason as the start)
+    old_score, old_segment = int(lead.get("score") or 0), lead.get("segment")
+    lead = _rescore_with_qualifier(campaign_prompt, lead)
+    score_changed = lead.get("score") != old_score or lead.get("segment") != old_segment
+
+    # 5. Regenerate A/B emails (needs segment hot/warm + insights)
+    sender_info = get_sender_config(default_only=True) or {
+        "name": os.getenv("SENDER_NAME", "[Your Name]"),
+        "title": os.getenv("SENDER_TITLE", ""),
+        "company": os.getenv("SENDER_COMPANY", ""),
+        "company_url": os.getenv("SENDER_COMPANY_URL", ""),
+        "company_description": os.getenv("SENDER_COMPANY_DESC", ""),
+    }
+    lead = _generate_one(lead, campaign_prompt, sender_info)
+
+    # 6. Persist insights + drafts (+ email_verified), then score/segment/reason/email/status
+    save_enrichment_results([lead])
+    has_drafts = bool(lead.get("draft_email") or lead.get("draft_emails"))
+    new_status = ("not_qualified" if not lead.get("email")
+                  else "enriched" if has_drafts else "qualified")
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE leads SET score = %s, segment = %s, reason = %s, status = %s, "
+            "company = %s, email = %s, email_source = %s, updated_at = %s WHERE id = %s",
+            (lead.get("score"), lead.get("segment"), lead.get("reason"), new_status,
+             lead.get("company"), lead.get("email"), lead.get("email_source"),
+             datetime.now().isoformat(), lead_id)
+        )
+
+    # 7. Return the fresh lead for the frontend
+    return {
+        "status": "re-enriched",
+        "score_changed": score_changed,
+        "email_verified": bool(lead.get("email_verified")),
+        "email_message": email_message,
+        "lead": get_lead(lead_id),
+    }
+
+
 @app.patch("/leads/{lead_id}")
 def update_lead_status(lead_id: str, update: LeadStatusUpdate):
     from memory.storage import get_conn
@@ -313,6 +523,50 @@ def update_lead_fields(lead_id: str, update: LeadFieldsUpdate):
 def get_events(campaign_id: str):
     events = get_campaign_events(campaign_id)
     return {"events": events}
+
+
+# ── Analyst (Agent 7) — reports, metrics, A/B, PDF ────────────────────────────
+
+@app.get("/analytics/campaign/{campaign_id}")
+def analytics_campaign(campaign_id: str, recommendations: bool = True):
+    """Full analyst report for one campaign (metrics + A/B + recommendations)."""
+    from agents.analyst_node import build_campaign_report
+    return build_campaign_report(campaign_id, with_recommendations=recommendations)
+
+
+@app.get("/analytics/campaign/{campaign_id}/pdf")
+def analytics_campaign_pdf(campaign_id: str):
+    """Download a PDF performance report for one campaign."""
+    from agents.analyst_node import build_campaign_report
+    from agents.analyst_pdf import build_campaign_pdf
+    report = build_campaign_report(campaign_id, with_recommendations=True)
+    pdf = build_campaign_pdf(report)
+    fname = f"report_{campaign_id}_{datetime.now().strftime('%Y%m%d')}.pdf"
+    return Response(
+        content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.get("/analytics/weekly")
+def analytics_weekly(recommendations: bool = True):
+    """Weekly report aggregating all campaigns."""
+    from agents.analyst_node import build_weekly_report
+    return build_weekly_report(with_recommendations=recommendations)
+
+
+@app.get("/analytics/weekly/pdf")
+def analytics_weekly_pdf():
+    """Download the weekly PDF report across all campaigns."""
+    from agents.analyst_node import build_weekly_report
+    from agents.analyst_pdf import build_weekly_pdf
+    report = build_weekly_report(with_recommendations=True)
+    pdf = build_weekly_pdf(report)
+    fname = f"weekly_report_{datetime.now().strftime('%Y%m%d')}.pdf"
+    return Response(
+        content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 # ── Exclusion list ────────────────────────────────────────────────────────────
@@ -991,28 +1245,7 @@ def start_scheduler():
     print("[Scheduler] Follow-up background thread launched")
 
 
- # ── Open / Click / Unsubscribe tracking ───────────────────────────────────────
-
-@app.get("/track/open/{sequence_id}/{token}")
-def track_open(sequence_id: int, token: str):
-    """1x1 pixel — records email open."""
-    expected = hashlib.md5(f"open-{sequence_id}".encode()).hexdigest()[:16]
-    if token == expected:
-        try:
-            with get_conn() as conn:
-                conn.cursor().execute("""
-                    UPDATE email_sequences
-                    SET status = CASE WHEN status = 'sent' THEN 'opened' ELSE status END,
-                        opened_at = COALESCE(opened_at, NOW())
-                    WHERE id = %s
-                """, (sequence_id,))
-                print(f"[Track] Open detected: sequence {sequence_id}")
-        except Exception as e:
-            print(f"[Track] Open error: {e}")
-
-    # Return 1x1 transparent GIF
-    pixel = b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x00\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b'
-    return Response(content=pixel, media_type="image/gif")
+ # ── Click / Unsubscribe tracking (open/pixel tracking removed) ────────────────
 
 
 def _unsub_page(title: str, message: str, lead_id: str = None,
@@ -1179,7 +1412,9 @@ def track_click(sequence_id: int, url: str = ""):
         with get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                UPDATE email_sequences SET clicked_at = COALESCE(clicked_at, NOW())
+                UPDATE email_sequences
+                SET clicked_at  = COALESCE(clicked_at, NOW()),
+                    click_count = COALESCE(click_count, 0) + 1
                 WHERE id = %s RETURNING lead_id, campaign_id
             """, (sequence_id,))
             row = cursor.fetchone()

@@ -127,9 +127,11 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete }) {
           </thead>
           <tbody>
             {filtered.map((lead) => {
-              const hasAB = lead.draft_emails && (typeof lead.draft_emails === "object"
-                ? Object.keys(lead.draft_emails).length > 1
-                : false);
+              // draft_emails may arrive as a JSON string — parse before counting variants
+              let de = lead.draft_emails;
+              if (typeof de === "string") { try { de = JSON.parse(de); } catch { de = null; } }
+              const variantCount = de && typeof de === "object" ? Object.keys(de).length : 0;
+              const hasAB = variantCount > 1;
 
               return (
                 <tr
@@ -169,10 +171,10 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete }) {
                   <td style={{ padding: "12px 8px" }}>
                     {hasAB ? (
                       <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: c.accentGlow, color: c.accent, fontFamily: f.mono, fontWeight: 600 }}>A/B</span>
-                    ) : lead.draft_email ? (
+                    ) : (variantCount === 1 || lead.draft_email) ? (
                       <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: c.greenGlow, color: c.green, fontFamily: f.mono, fontWeight: 600 }}>1</span>
                     ) : (
-                      <span style={{ fontSize: 12, color: c.textDim }}>\u2014</span>
+                      <span style={{ fontSize: 12, color: c.textDim }}>{"\u2014"}</span>
                     )}
                   </td>
                   <td style={{ padding: "12px 16px" }}>

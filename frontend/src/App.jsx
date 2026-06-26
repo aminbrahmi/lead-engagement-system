@@ -90,7 +90,7 @@ function AppRoutes() {
         <Route path="pipeline" element={<PipelinePage currentStage={currentStage} logs={logs} isRunning={isRunning} />} />
         <Route path="leads" element={<LeadsPage leads={leads} onUpdateLead={handleUpdateLead} activeCampaign={activeCampaign} campaigns={campaigns} onViewCampaign={handleViewCampaign} onRefresh={handleRefresh} />} />
         <Route path="inbox" element={<InboxPage />} />
-        <Route path="analytics" element={<AnalyticsPage leads={leads} />} />
+        <Route path="analytics" element={<AnalyticsPage leads={leads} campaigns={campaigns} activeCampaign={activeCampaign} />} />
         <Route path="exclusions" element={<ExclusionsPage />} />
       </Route>
     </Routes>

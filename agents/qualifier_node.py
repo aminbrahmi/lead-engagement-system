@@ -23,7 +23,9 @@ from utils.json_utils import extract_json_list, detect_truncation
 _name_enricher = NameEnricherTool()
 _email_finder  = EmailFinderTool()
 
-TRUSTED_SOURCES = {"findthatlead", "hunter", "apollo", "google", "ftl"}
+# APIs whose emails are reliable without an SMTP check.
+# (Web/Google & scraping are NOT here — they must be SMTP-verified to be trusted.)
+TRUSTED_SOURCES = {"findthatlead", "hunter", "apollo", "ftl"}
 
 
 def is_auto_verified(email_source: str) -> bool:
@@ -31,13 +33,72 @@ def is_auto_verified(email_source: str) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# NAME VALIDATION — reject job titles / places / generic junk as person names
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Tokens that never appear in a real person's name (lowercased)
+_NON_PERSON_TOKENS = {
+    "job", "jobs", "career", "careers", "hiring", "vacancy", "vacancies",
+    "recruit", "recruitment", "apply", "salary", "remote", "internship",
+    "listing", "listings", "opening", "openings", "position", "positions",
+    "gmbh", "ltd", "inc", "llc", "corp", "company", "team", "staff",
+    "department", "news", "press", "blog", "about", "contact", "support",
+    "admin", "info", "startup", "startups", "ventures", "capital", "fund",
+    "group", "solutions", "services", "technologies", "unknown", "n/a", "none",
+}
+
+
+def _looks_like_person_name(name: str, location: str = "") -> bool:
+    """Heuristic: does this string look like a real person's name?
+    Rejects digits, job/listing keywords, and names equal to the location."""
+    if not name:
+        return False
+    n = name.strip()
+    low = n.lower()
+    if low in ("", "unknown", "n/a", "none"):
+        return False
+    if any(ch.isdigit() for ch in n):          # names never contain digits
+        return False
+
+    words = [w.strip(".,") for w in re.split(r"\s+", low) if w]
+    if not words:
+        return False
+    # Any junk token present → not a person ("Germany job", "Sales team", ...)
+    if any(w in _NON_PERSON_TOKENS for w in words):
+        return False
+    # Name equal to or built around the location ("Germany", "Berlin")
+    loc = (location or "").lower().strip()
+    if loc and (low == loc or loc in words):
+        return False
+    return True
+
+
+def _normalize_bad_names(leads: list) -> list:
+    """Set obviously-invalid names to 'unknown' so they go through name
+    enrichment (and get auto-rejected if no real name can be found)."""
+    out = []
+    for lead in leads:
+        name = lead.get("name", "")
+        if not _looks_like_person_name(name, lead.get("location", "")):
+            if name and name.lower() != "unknown":
+                print(f"[Qualifier] ⚠ Invalid name '{name}' → unknown ({lead.get('company')})")
+            lead = dict(lead)
+            lead["name"] = "unknown"
+        out.append(lead)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # DOMAIN RESOLUTION
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _resolve_company_domain(company: str) -> str:
-    slug = re.sub(r'[^a-z0-9]', '', company.lower().split()[0]) if company else ""
+    comp = (company or "").lower().strip()
+    if comp in ("", "unknown", "n/a", "none", "null"):
+        return ""   # no real company → never fabricate a domain
+    slug = re.sub(r'[^a-z0-9]', '', comp.split()[0]) if comp else ""
     if not slug:
-        return f"{company.lower().replace(' ','')}.com"
+        return ""
 
     for tld in [".ai", ".io", ".com", ".de", ".co", ".tech"]:
         domain = slug + tld
@@ -155,18 +216,95 @@ def _find_emails_parallel(leads: list, max_workers: int = 6) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# COMPANY ENRICHMENT — find the employer from the person's name (reverse lookup)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def find_company(lead: dict) -> dict:
+    """Find the employer company for a lead that has a name but no company.
+    Uses a Tavily web search + LLM extraction. Returns the lead (company filled
+    if found, otherwise unchanged)."""
+    import os
+    import requests
+
+    name = (lead.get("name") or "").strip()
+    if not name or name.lower() == "unknown":
+        return lead
+
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if not api_key:
+        return lead
+
+    role     = (lead.get("role") or "").strip()
+    location = (lead.get("location") or "").strip()
+    query = f'"{name}" {role} {location} company employer LinkedIn'.strip()
+
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={"api_key": api_key, "query": query,
+                  "max_results": 5, "include_answer": True},
+            timeout=15,
+        )
+        data = resp.json()
+        context = data.get("answer", "") or ""
+        for r in data.get("results", []):
+            context += f"\n{r.get('title','')} — {r.get('content','')[:200]}"
+    except Exception as e:
+        print(f"[Qualifier] Company search failed for {name}: {e}")
+        return lead
+
+    if not context.strip():
+        return lead
+
+    from agents.llm_factory import get_qualifier_llm
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    prompt = f"""From the research below, identify the CURRENT employer company of {name}{f' ({role})' if role else ''}.
+
+Research:
+{context[:2000]}
+
+Return ONLY the company name — nothing else. If you cannot determine it confidently, return exactly: unknown"""
+
+    try:
+        out = get_qualifier_llm().invoke([
+            SystemMessage(content="You extract a person's current employer company from research text. Be precise — return only the company name."),
+            HumanMessage(content=prompt),
+        ]).content
+        if isinstance(out, list):
+            out = " ".join(b.get("text", "") for b in out if isinstance(b, dict))
+        company = (out or "").strip().splitlines()[0].strip().strip('".\'')
+
+        # Validate: must look like a company name, not a sentence or junk
+        low = company.lower()
+        if (company and low not in ("unknown", "n/a", "none", "")
+                and len(company) <= 60 and len(company.split()) <= 6
+                and "cannot" not in low and "not " not in low):
+            lead = dict(lead)
+            lead["company"] = company
+            print(f"[Qualifier] [OK] Company found for {name}: {company}")
+        else:
+            print(f"[Qualifier] [--] Company not determined for {name}")
+    except Exception as e:
+        print(f"[Qualifier] Company extraction failed for {name}: {e}")
+
+    return lead
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # STEP 3 — SCORING
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _compact_lead(lead: dict) -> dict:
     return {
-        "name":         lead.get("name", "unknown"),
-        "company":      lead.get("company", ""),
-        "role":         lead.get("role", ""),
-        "location":     lead.get("location", ""),
-        "email":        lead.get("email"),
-        "email_source": lead.get("email_source"),
-        "notes":        (lead.get("notes") or "")[:120],
+        "name":           lead.get("name", "unknown"),
+        "company":        lead.get("company", ""),
+        "role":           lead.get("role", ""),
+        "location":       lead.get("location", ""),
+        "email":          lead.get("email"),
+        "email_source":   lead.get("email_source"),
+        "email_verified": bool(lead.get("email_verified")),
+        "notes":          (lead.get("notes") or "")[:120],
     }
 
 
@@ -234,6 +372,48 @@ def classify_no_email_leads(leads: list) -> list:
     return leads
 
 
+def is_reliable_email(lead: dict) -> bool:
+    """An email is reliable if:
+      • SMTP-confirmed, OR
+      • from a trusted API (FindThatLead / Hunter / Apollo), OR
+      • a generic company mailbox (contact@/info@…) — acceptable last resort.
+    Guessed nominative patterns / unverified web emails are NOT reliable."""
+    if not lead.get("email"):
+        return False
+    if lead.get("email_verified"):
+        return True
+    src = (lead.get("email_source") or "").lower().strip()
+    if is_auto_verified(src):
+        return True
+    if src == "generic":
+        return True   # contact@/info@ on the company domain — low bounce risk
+    return False
+
+
+def apply_segment_rules(lead: dict) -> dict:
+    """Canonical segmentation — single source of truth used at collection AND
+    re-enrichment. Only a RELIABLE email can be warm/hot; unverified guesses
+    stay cold so we never auto-email a made-up address.
+        no email / unreliable email → cold
+        reliable + score >= 75       → hot
+        reliable + score 45-74       → warm
+        reliable + score < 45        → cold
+    """
+    score = int(lead.get("score") or 0)
+    if not is_reliable_email(lead):
+        lead["score"]   = min(score, 20 if not lead.get("email") else 40)
+        lead["segment"] = "cold"
+        return lead
+    if score >= 75:
+        lead["segment"] = "hot"
+    elif score >= 45:
+        lead["segment"] = "warm"
+    else:
+        lead["segment"] = "cold"
+    lead["score"] = score
+    return lead
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ──────────────────────────────────────────────────────────────────────────────
@@ -246,6 +426,9 @@ def run_qualifier(campaign_prompt: str, raw_leads_json: str) -> str:
         return "[]"
 
     print(f"[Qualifier] Processing {len(raw_leads)} leads…")
+
+    # Reject junk names (job titles, places, generic terms) → 'unknown'
+    raw_leads = _normalize_bad_names(raw_leads)
 
     leads = _enrich_names_parallel(raw_leads)
     leads = _find_emails_parallel(leads)
@@ -299,8 +482,20 @@ def run_qualifier(campaign_prompt: str, raw_leads_json: str) -> str:
         if parsed:
             print(f"[Qualifier] ✓ Parsed {len(parsed)} leads")
 
+            # Carry SMTP/API verification status from the pre-scored leads
+            # (the LLM output doesn't include email_verified / email_source).
+            meta = {l["email"].lower(): (bool(l.get("email_verified")), l.get("email_source"))
+                    for l in scoreable if l.get("email")}
+            for l in parsed:
+                if l.get("email") and l["email"].lower() in meta:
+                    ev, es = meta[l["email"].lower()]
+                    l["email_verified"] = ev
+                    if not l.get("email_source"):
+                        l["email_source"] = es
+
             all_leads = parsed + rejected
             all_leads = classify_no_email_leads(all_leads)
+            all_leads = [apply_segment_rules(l) for l in all_leads]   # strict segmentation
 
             return json.dumps(all_leads)
 
@@ -311,5 +506,6 @@ def run_qualifier(campaign_prompt: str, raw_leads_json: str) -> str:
     scored = _default_score_leads(scoreable)
     all_leads = scored + rejected
     all_leads = classify_no_email_leads(all_leads)
+    all_leads = [apply_segment_rules(l) for l in all_leads]           # strict segmentation
 
     return json.dumps(all_leads)

@@ -42,3 +42,6 @@ dnspython
 
 google-api-python-client
 google-auth-oauthlib
+
+# PDF reports (Agent Analyst)
+reportlab
