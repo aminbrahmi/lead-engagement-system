@@ -26,3 +26,6 @@ export const updateLeadFields = (id, fields) =>
 // Longer timeout: this does Tavily searches + LLM calls + SMTP verification.
 export const reEnrichLead = (id) =>
   client.post(`/leads/${id}/re-enrich`, {}, { timeout: 100000 });
+
+// ML: predicted reply probability (0-100) for each lead → { available, scores: {id: pct} }
+export const getReplyScores = () => client.post("/leads/reply-scores");

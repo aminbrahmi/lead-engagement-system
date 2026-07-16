@@ -60,13 +60,22 @@ function ConfirmModal({ lead, onConfirm, onCancel, theme }) {
   );
 }
 
-export default function LeadTable({ leads, onSelect, selectedId, onDelete }) {
+export default function LeadTable({ leads, onSelect, selectedId, onDelete, replyScores }) {
   const { theme } = useTheme();
   const c = theme.colors;
   const f = theme.fonts;
   const [filter, setFilter] = useState("all");
+  const [sortBy, setSortBy] = useState("date");   // date | name | score | reply
   const [pendingDelete, setPendingDelete] = useState(null);
-  const filtered = filter === "all" ? leads : leads.filter((l) => l.segment === filter);
+
+  const base = filter === "all" ? leads : leads.filter((l) => l.segment === filter);
+  const filtered = [...base].sort((a, b) => {
+    if (sortBy === "name") return (a.name || "").localeCompare(b.name || "");
+    if (sortBy === "score") return (b.score || 0) - (a.score || 0);
+    if (sortBy === "reply") return ((replyScores?.[b.id] ?? -1) - (replyScores?.[a.id] ?? -1));
+    // date (most recent first)
+    return new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0);
+  });
   const counts = {
     all: leads.length,
     hot: leads.filter((l) => l.segment === "hot").length,
@@ -99,17 +108,37 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete }) {
         display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12,
       }}>
         <h3 style={{ fontSize: 15, fontWeight: 600, color: c.text }}>Leads ({filtered.length})</h3>
-        <div style={{ display: "flex", gap: 6 }}>
-          {["all", "hot", "warm", "cold"].map((seg) => (
-            <button key={seg} onClick={() => setFilter(seg)} style={{
-              padding: "4px 12px", borderRadius: 6,
-              border: `1px solid ${filter === seg ? c.accent : c.border}`,
-              background: filter === seg ? c.accentGlow : "transparent",
-              color: filter === seg ? c.accent : c.textMuted,
-              fontSize: 12, cursor: "pointer", fontFamily: f.body,
-              textTransform: "capitalize", fontWeight: filter === seg ? 600 : 400,
-            }}>{seg} ({counts[seg]})</button>
-          ))}
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 6 }}>
+            {["all", "hot", "warm", "cold"].map((seg) => (
+              <button key={seg} onClick={() => setFilter(seg)} style={{
+                padding: "4px 12px", borderRadius: 6,
+                border: `1px solid ${filter === seg ? c.accent : c.border}`,
+                background: filter === seg ? c.accentGlow : "transparent",
+                color: filter === seg ? c.accent : c.textMuted,
+                fontSize: 12, cursor: "pointer", fontFamily: f.body,
+                textTransform: "capitalize", fontWeight: filter === seg ? 600 : 400,
+              }}>{seg} ({counts[seg]})</button>
+            ))}
+          </div>
+          {/* Sort control */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 11, color: c.textDim }}>Sort:</span>
+            <select
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value)}
+              title="Sort leads"
+              style={{
+                padding: "5px 10px", borderRadius: 6, border: `1px solid ${c.border}`,
+                background: c.surface, color: c.text, fontSize: 12, fontFamily: f.body, cursor: "pointer",
+              }}
+            >
+              <option value="date">Date</option>
+              <option value="name">Name</option>
+              <option value="score">Score</option>
+              {replyScores && <option value="reply">Reply %</option>}
+            </select>
+          </div>
         </div>
       </div>
       <div style={{ overflowX: "auto" }}>
@@ -117,10 +146,11 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete }) {
           <thead>
             <tr style={{ borderBottom: `1px solid ${c.border}` }}>
               {/* Removed email verification column */}
-              {["Name", "Company", "Role", "Score", "Segment", "Email", "Emails", "Status", ""].map((h) => (
+              {["Name", "Company", "Role", "Score", ...(replyScores ? ["Reply %"] : []), "Segment", "Email", "Emails", "Status", ""].map((h) => (
                 <th key={h} style={{
                   padding: "10px 16px", textAlign: "left", fontSize: 10,
                   color: c.textDim, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase",
+                  whiteSpace: "nowrap",
                 }}>{h}</th>
               ))}
             </tr>
@@ -163,6 +193,17 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete }) {
                       </div>
                     </div>
                   </td>
+                  {replyScores && (
+                    <td style={{ padding: "12px 16px", minWidth: 70 }}>
+                      {typeof replyScores[lead.id] === "number" ? (
+                        <span style={{
+                          fontSize: 11, fontWeight: 700, fontFamily: f.mono, padding: "2px 8px", borderRadius: 4,
+                          color: replyScores[lead.id] >= 60 ? c.green : replyScores[lead.id] >= 40 ? c.warm : c.textMuted,
+                          background: replyScores[lead.id] >= 60 ? c.greenGlow : replyScores[lead.id] >= 40 ? c.warmGlow : c.surfaceAlt,
+                        }} title="Predicted reply probability (ML)">{replyScores[lead.id]}%</span>
+                      ) : <span style={{ color: c.textDim }}>—</span>}
+                    </td>
+                  )}
                   <td style={{ padding: "12px 16px" }}><Badge segment={lead.segment} /></td>
                   <td style={{ padding: "12px 16px", fontFamily: f.mono, fontSize: 12, color: lead.email ? c.textMuted : c.textDim, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {lead.email || "\u2014"}

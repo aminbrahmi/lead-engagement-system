@@ -89,7 +89,7 @@ _ACTIONS_MAP = {
     "info_request": [
         "cancel_immediate_followup",
         "keep_longterm_followups",
-        "update_status_replied_info_request",
+        "update_status_info_request",
         "update_segment_warm",
         "add_score_20",
         "flag_needs_info",

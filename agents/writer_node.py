@@ -260,6 +260,12 @@ def _generate_one(lead: dict, campaign_prompt: str, sender_info: dict) -> dict:
     name = lead.get("name", "")
     company = lead.get("company", "")
 
+    # Don't draft emails for leads we can't actually contact:
+    #  - no email address → nothing to send to (and the UI won't even show the editor)
+    #  - unknown name → can't personalize ("Hi unknown,")
+    if not lead.get("email") or (name or "").strip().lower() in ("", "unknown"):
+        return lead
+
     # Generate whenever we have insights — drafting is independent of the segment.
     # (A cold/unverified lead still gets a draft ready; whether it is *sent* is
     #  decided elsewhere by the email-reliability rules.)

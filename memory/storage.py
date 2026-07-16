@@ -1,6 +1,7 @@
 # memory/storage.py — PostgreSQL version
 import json
 import os
+import re
 import hashlib
 from datetime import datetime
 from contextlib import contextmanager
@@ -72,6 +73,15 @@ def init_db():
     _ensure_dirs()
     with get_conn() as conn:
         cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            SERIAL PRIMARY KEY,
+                email         TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                name          TEXT,
+                created_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS leads (
                 id               VARCHAR(12) PRIMARY KEY,
@@ -218,6 +228,20 @@ def init_db():
         cursor.execute("ALTER TABLE sender_config ADD COLUMN IF NOT EXISTS smtp_pass TEXT")
         cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS campaign VARCHAR(255)")
         cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ")
+        # User profile (feeds email generation) + email verification
+        for col, typ in [
+            ("role", "TEXT"), ("company", "TEXT"), ("company_description", "TEXT"),
+            ("company_url", "TEXT"), ("company_location", "TEXT"), ("company_size", "TEXT"),
+            ("signature", "TEXT"), ("photo_url", "TEXT"),
+            ("email_verified", "BOOLEAN DEFAULT FALSE"), ("verification_token", "TEXT"),
+        ]:
+            cursor.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {typ}")
+
+        # Multi-tenant ownership
+        cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS user_id INTEGER")
+        cursor.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS user_id INTEGER")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_campaigns_user ON campaigns(user_id)")
+        _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_leads_user ON leads(user_id)")
         cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ")
         cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS clicked_at TIMESTAMPTZ")
         cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS recipient_email TEXT")
@@ -270,14 +294,131 @@ def init_db():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _generate_id(name: str, company: str) -> str:
-    raw = company.lower().strip()
+_COMPANY_STOPWORDS = {
+    "the", "group", "holding", "holdings", "inc", "llc", "ltd", "limited",
+    "sa", "spa", "srl", "gmbh", "co", "corp", "corporation", "company",
+    "net", "porter", "a", "and", "&",
+}
+
+
+def _company_key(company: str) -> str:
+    """Normalize a company name to a stable key so name variants collapse:
+    'Yoox', 'Yoox Net-a-Porter Group' → 'yoox'. Uses the first significant token."""
+    c = re.sub(r"[^a-z0-9 ]", " ", (company or "unknown").lower())
+    tokens = [t for t in c.split() if t and t not in _COMPANY_STOPWORDS]
+    return tokens[0] if tokens else (c.replace(" ", "") or "unknown")
+
+
+def _generate_id(name: str, company: str, user_id=None) -> str:
+    # user_id scopes the id per user → two users collecting the same company
+    # get different lead ids (no cross-user collision).
+    raw = _company_key(company)
+    if user_id is not None:
+        raw = f"u{user_id}:{raw}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
-def _generate_campaign_id(prompt: str) -> str:
-    """Same prompt always produces the same campaign ID."""
+# ── Users (authentication) ────────────────────────────────────────────────────
+
+_USER_PROFILE_FIELDS = (
+    "name", "role", "company", "company_description", "company_url",
+    "company_location", "company_size", "signature", "photo_url",
+)
+
+
+def create_user(email: str, password_hash: str, profile: dict = None,
+                verification_token: str = None) -> dict | None:
+    init_db()
+    profile = profile or {}
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            cursor.execute("""
+                INSERT INTO users (email, password_hash, name, role, company,
+                    company_description, company_url, company_location, company_size,
+                    signature, photo_url, verification_token)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, email, name
+            """, (
+                email.lower().strip(), password_hash,
+                profile.get("name"), profile.get("role"), profile.get("company"),
+                profile.get("company_description"), profile.get("company_url"),
+                profile.get("company_location"), profile.get("company_size"),
+                profile.get("signature"), profile.get("photo_url"), verification_token,
+            ))
+            return dict(cursor.fetchone())
+        except Exception as e:
+            print(f"[Storage] create_user error: {e}")
+            return None   # duplicate email (UNIQUE) or other error
+
+
+def _public_user(row: dict) -> dict:
+    """User dict without sensitive fields (password_hash, token)."""
+    if not row:
+        return None
+    d = dict(row)
+    d.pop("password_hash", None)
+    d.pop("verification_token", None)
+    if d.get("created_at") and hasattr(d["created_at"], "isoformat"):
+        d["created_at"] = d["created_at"].isoformat()
+    return d
+
+
+def get_user_by_email(email: str) -> dict | None:
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM users WHERE email = %s", (email.lower().strip(),))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_user_by_id(user_id: int, public: bool = True) -> dict | None:
+    with get_conn() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return _public_user(row) if public else dict(row)
+
+
+def update_user(user_id: int, fields: dict) -> dict | None:
+    """Update editable profile fields."""
+    allowed = {k: v for k, v in (fields or {}).items() if k in _USER_PROFILE_FIELDS}
+    if not allowed:
+        return get_user_by_id(user_id)
+    sets = ", ".join(f"{k} = %s" for k in allowed)
+    vals = list(allowed.values()) + [user_id]
+    with get_conn() as conn:
+        conn.cursor().execute(f"UPDATE users SET {sets} WHERE id = %s", vals)
+    return get_user_by_id(user_id)
+
+
+def verify_user_token(token: str) -> bool:
+    """Mark a user's email verified from their verification token."""
+    if not token:
+        return False
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET email_verified = TRUE, verification_token = NULL "
+            "WHERE verification_token = %s RETURNING id",
+            (token,),
+        )
+        return cursor.fetchone() is not None
+
+
+def set_verification_token(user_id: int, token: str):
+    with get_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE users SET verification_token = %s WHERE id = %s", (token, user_id))
+
+
+def _generate_campaign_id(prompt: str, user_id=None) -> str:
+    """Same prompt (per user) always produces the same campaign ID."""
     normalized = prompt.strip().lower()
+    if user_id is not None:
+        normalized = f"u{user_id}:{normalized}"
     return hashlib.md5(normalized.encode()).hexdigest()[:12]
 
 
@@ -293,9 +434,9 @@ def _is_valid_lead(lead: dict) -> bool:
 
 # ── Campaign queries ──────────────────────────────────────────────────────────
 
-def get_campaign_by_prompt(prompt: str) -> dict | None:
-    """Check if a campaign with this prompt already exists."""
-    campaign_id = _generate_campaign_id(prompt)
+def get_campaign_by_prompt(prompt: str, user_id=None) -> dict | None:
+    """Check if a campaign with this prompt already exists (for this user)."""
+    campaign_id = _generate_campaign_id(prompt, user_id)
     with get_conn() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute("SELECT * FROM campaigns WHERE id = %s", (campaign_id,))
@@ -303,12 +444,14 @@ def get_campaign_by_prompt(prompt: str) -> dict | None:
         return dict(row) if row else None
 
 
-def get_all_campaigns() -> list:
-    """Return all campaigns with lead count breakdown."""
+def get_all_campaigns(user_id=None) -> list:
+    """Return all campaigns with lead count breakdown (scoped to user_id if given)."""
     init_db()
     with get_conn() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("""
+        where = "WHERE c.user_id = %s" if user_id is not None else ""
+        params = (user_id,) if user_id is not None else ()
+        cursor.execute(f"""
             SELECT
                 c.id,
                 c.prompt,
@@ -321,19 +464,20 @@ def get_all_campaigns() -> list:
                 COUNT(CASE WHEN l.draft_email IS NOT NULL THEN 1 END) AS emails_count
             FROM campaigns c
             LEFT JOIN leads l ON l.campaign = c.id
+            {where}
             GROUP BY c.id
             ORDER BY COALESCE(c.updated_at, c.created_at) DESC
-        """)
+        """, params)
         return [dict(row) for row in cursor.fetchall()]
 
 
 # ── Save leads (Agent 1 output) ──────────────────────────────────────────────
 
-def save_leads(leads: list, campaign_prompt: str) -> dict:
+def save_leads(leads: list, campaign_prompt: str, user_id=None) -> dict:
     _ensure_dirs()
     init_db()
 
-    campaign_id = _generate_campaign_id(campaign_prompt)
+    campaign_id = _generate_campaign_id(campaign_prompt, user_id)
     now         = datetime.now().isoformat()
     added       = 0
     duplicates  = 0
@@ -358,15 +502,16 @@ def save_leads(leads: list, campaign_prompt: str) -> dict:
             for lead in leads:
                 lead_id = _generate_id(
                     lead.get("name", "unknown"),
-                    lead.get("company", "unknown")
+                    lead.get("company", "unknown"),
+                    user_id,
                 )
                 cursor.execute("SELECT id FROM leads WHERE id = %s", (lead_id,))
                 existing = cursor.fetchone()
 
                 if existing:
                     cursor.execute(
-                        "UPDATE leads SET updated_at = %s, campaign = %s WHERE id = %s",
-                        (now, campaign_id, lead_id)
+                        "UPDATE leads SET updated_at = %s, campaign = %s, user_id = %s WHERE id = %s",
+                        (now, campaign_id, user_id, lead_id)
                     )
                     duplicates += 1
                     print(f"[Storage] Duplicate updated: {lead.get('company')}")
@@ -374,8 +519,8 @@ def save_leads(leads: list, campaign_prompt: str) -> dict:
                     cursor.execute("""
                         INSERT INTO leads
                         (id, name, company, role, location, source_url, notes,
-                         campaign, status, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'collected', %s, %s)
+                         campaign, user_id, status, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'collected', %s, %s)
                     """, (
                         lead_id,
                         lead.get("name", "unknown"),
@@ -385,6 +530,7 @@ def save_leads(leads: list, campaign_prompt: str) -> dict:
                         lead.get("source_url", ""),
                         lead.get("notes", ""),
                         campaign_id,
+                        user_id,
                         now, now
                     ))
                     added += 1
@@ -392,14 +538,14 @@ def save_leads(leads: list, campaign_prompt: str) -> dict:
 
             # Upsert campaign — create if new, update if exists
             cursor.execute("""
-                INSERT INTO campaigns (id, prompt, leads_count, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO campaigns (id, prompt, user_id, leads_count, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     leads_count = (
                         SELECT COUNT(*) FROM leads WHERE campaign = %s
                     ),
                     updated_at = %s
-            """, (campaign_id, campaign_prompt, added, now, now, campaign_id, now))
+            """, (campaign_id, campaign_prompt, user_id, added, now, now, campaign_id, now))
 
             print(f"[Storage] PostgreSQL: {added} inserted, {duplicates} duplicates")
 
@@ -483,22 +629,29 @@ def save_leads(leads: list, campaign_prompt: str) -> dict:
 
 # ── Read queries ──────────────────────────────────────────────────────────────
 
-def get_all_leads(status: str = None) -> list:
+def get_all_leads(status: str = None, user_id=None) -> list:
     init_db()
+    clauses, params = [], []
+    if status:
+        clauses.append("status = %s"); params.append(status)
+    if user_id is not None:
+        clauses.append("user_id = %s"); params.append(user_id)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     with get_conn() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        if status:
-            cursor.execute("SELECT * FROM leads WHERE status = %s", (status,))
-        else:
-            cursor.execute("SELECT * FROM leads ORDER BY created_at DESC")
+        cursor.execute(f"SELECT * FROM leads {where} ORDER BY created_at DESC", tuple(params))
         return [dict(row) for row in cursor.fetchall()]
 
 
-def get_campaign_leads(campaign_id: str) -> list:
+def get_campaign_leads(campaign_id: str, user_id=None) -> list:
     init_db()
     with get_conn() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM leads WHERE campaign = %s ORDER BY score DESC", (campaign_id,))
+        if user_id is not None:
+            cursor.execute("SELECT * FROM leads WHERE campaign = %s AND user_id = %s ORDER BY score DESC",
+                           (campaign_id, user_id))
+        else:
+            cursor.execute("SELECT * FROM leads WHERE campaign = %s ORDER BY score DESC", (campaign_id,))
         return [dict(row) for row in cursor.fetchall()]
 
 
@@ -513,7 +666,7 @@ def is_duplicate(name: str, company: str) -> bool:
 
 # ── Update qualification (Agent 2 output) ─────────────────────────────────────
 
-def update_lead_qualification(qualified_leads: list) -> int:
+def update_lead_qualification(qualified_leads: list, user_id=None) -> int:
     init_db()
     now = datetime.now().isoformat()
     updated = 0
@@ -524,7 +677,8 @@ def update_lead_qualification(qualified_leads: list) -> int:
         for lead in qualified_leads:
             lead_id = _generate_id(
                 lead.get("name", "unknown"),
-                lead.get("company", "unknown")
+                lead.get("company", "unknown"),
+                user_id,
             )
             lead["id"] = lead_id   # ensure frontend can reference the DB id
             score   = lead.get("score", 0)
@@ -605,7 +759,7 @@ def _sync_json_with_qualification(qualified_leads: list):
 
 # ── Save enrichment results (Agent 3 + 4 output) ─────────────────────────────
 
-def save_enrichment_results(enriched_leads: list) -> int:
+def save_enrichment_results(enriched_leads: list, user_id=None) -> int:
     """Persist insights and draft_email for each lead to PostgreSQL and JSON."""
     init_db()
     now = datetime.now().isoformat()
@@ -619,7 +773,8 @@ def save_enrichment_results(enriched_leads: list) -> int:
             # when the company was enriched/changed (the row id stays the original).
             lead_id = lead.get("id") or _generate_id(
                 lead.get("name", "unknown"),
-                lead.get("company", "unknown")
+                lead.get("company", "unknown"),
+                user_id,
             )
             lead["id"] = lead_id   # ensure frontend can reference the DB id
 

@@ -27,7 +27,7 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from utils.email_verifier import verify_email, should_auto_verify
@@ -49,7 +49,14 @@ from memory.storage import (
     get_exclusion_list, add_exclusion, remove_exclusion, remove_exclusion_by_value,
     get_sender_config, save_sender_config, update_sender_config,
     find_similar_campaign, save_campaign_criteria, delete_lead_completely,
+    create_user, get_user_by_email, get_user_by_id,
+    update_user, verify_user_token, set_verification_token,
 )
+from utils.auth import hash_password, verify_password, create_token, decode_token
+import re as _re
+import secrets as _secrets
+import smtplib as _smtplib
+from email.mime.text import MIMEText as _MIMEText
 from orchestration.graph import build_pipeline, LeadPipelineState
 from utils.json_utils import extract_json_list
 
@@ -67,9 +74,13 @@ app.add_middleware(
 
 init_db()
 
-# Base URL used in customer-facing links (unsubscribe / resubscribe).
-# Must match the host the recipient can reach — same value the sender uses.
+# Base URL used in customer-facing links (unsubscribe / resubscribe / click tracking).
+# These are clicked by external leads → must be publicly reachable (ngrok / deploy).
 BASE_URL = os.getenv("REACT_APP_API_URL", "http://localhost:8000")
+
+# URL for links YOU click yourself (email verification) — defaults to localhost,
+# so account verification never needs a public tunnel.
+APP_URL = os.getenv("APP_URL", "http://localhost:8000")
 
 # ── In-memory campaign store ─────────────────────────────────────────────────
 
@@ -141,41 +152,212 @@ def health():
     return {"status": "ok"}
 
 
+# ── Authentication ────────────────────────────────────────────────────────────
+
+_EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+_NAME_RE  = _re.compile(r"^[A-Za-zÀ-ÿ0-9'’.\-&,()  ]{2,80}$")
+_URL_RE   = _re.compile(r"^https?://[^\s]+\.[^\s]+$")
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
+    role: Optional[str] = None
+    company: Optional[str] = None
+    company_description: Optional[str] = None
+    company_url: Optional[str] = None
+    company_location: Optional[str] = None
+    company_size: Optional[str] = None
+    photo_url: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    company: Optional[str] = None
+    company_description: Optional[str] = None
+    company_url: Optional[str] = None
+    company_location: Optional[str] = None
+    company_size: Optional[str] = None
+    signature: Optional[str] = None
+    photo_url: Optional[str] = None
+
+
+def get_current_user(authorization: str = Header(None)) -> int:
+    """FastAPI dependency: extract & validate the JWT, return the user id."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = decode_token(authorization[7:])
+    if not payload or "sub" not in payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return int(payload["sub"])
+
+
+def _send_verification_email(to_email: str, token: str) -> bool:
+    """Send an account-verification email via SMTP."""
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_pass = os.getenv("SMTP_PASS", "")
+    if not smtp_user or not smtp_pass:
+        print("[Auth] ⚠ SMTP not configured — skipping verification email")
+        return False
+
+    link = f"{APP_URL}/auth/verify/{token}"
+    html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#f5f6fa;padding:24px">
+      <div style="max-width:480px;margin:auto;background:#fff;border-radius:14px;padding:32px;text-align:center">
+        <h2 style="color:#2d3436">Verify your email</h2>
+        <p style="color:#636e72;line-height:1.6">Welcome to TheLeadFlow! Confirm your email to activate your account.</p>
+        <a href="{link}" style="display:inline-block;margin-top:16px;padding:12px 28px;background:#6c5ce7;
+           color:#fff;text-decoration:none;border-radius:8px;font-weight:600">Verify my account</a>
+        <p style="color:#b2bec3;font-size:12px;margin-top:20px">Or paste this link: {link}</p>
+      </div></body></html>"""
+    msg = _MIMEText(html, "html", "utf-8")
+    msg["Subject"] = "Verify your TheLeadFlow account"
+    msg["From"] = smtp_user
+    msg["To"] = to_email
+    try:
+        # Decide by PORT (like sender_node): 465 = implicit SSL, 587 = STARTTLS.
+        if smtp_port == 465:
+            with _smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as s:
+                s.login(smtp_user, smtp_pass)
+                s.sendmail(smtp_user, [to_email], msg.as_string())
+        else:
+            with _smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
+                s.ehlo(); s.starttls(); s.ehlo()
+                s.login(smtp_user, smtp_pass)
+                s.sendmail(smtp_user, [to_email], msg.as_string())
+        print(f"[Auth] ✓ Verification email sent to {to_email}")
+        return True
+    except Exception as e:
+        print(f"[Auth] ✗ Verification email failed: {e}")
+        return False
+
+
+def _profile_public(user: dict) -> dict:
+    """Fields returned to the frontend."""
+    return {k: user.get(k) for k in (
+        "id", "email", "name", "role", "company", "company_description",
+        "company_url", "company_location", "company_size", "signature",
+        "photo_url", "email_verified",
+    )}
+
+
+@app.post("/auth/register")
+def register(req: RegisterRequest):
+    email = (req.email or "").strip().lower()
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(400, "Please enter a valid email address")
+    if len(req.password or "") < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    if req.name and not _NAME_RE.match(req.name.strip()):
+        raise HTTPException(400, "Name contains invalid characters")
+    if req.company_url and not _URL_RE.match(req.company_url.strip()):
+        raise HTTPException(400, "Company URL must start with http:// or https://")
+
+    verif_token = _secrets.token_urlsafe(24)
+    profile = {k: (getattr(req, k) or None) for k in (
+        "name", "role", "company", "company_description", "company_url",
+        "company_location", "company_size", "photo_url",
+    )}
+    user = create_user(email, hash_password(req.password), profile, verif_token)
+    if not user:
+        raise HTTPException(409, "This email is already registered")
+
+    email_sent = _send_verification_email(email, verif_token)
+    token = create_token(user["id"], user["email"])
+    full = get_user_by_id(user["id"])
+    return {"token": token, "user": _profile_public(full), "email_sent": email_sent}
+
+
+@app.post("/auth/login")
+def login(req: LoginRequest):
+    user = get_user_by_email((req.email or "").strip().lower())
+    if not user or not verify_password(req.password or "", user["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+    token = create_token(user["id"], user["email"])
+    return {"token": token, "user": _profile_public(user)}
+
+
+@app.get("/auth/me")
+def auth_me(user_id: int = Depends(get_current_user)):
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    return _profile_public(user)
+
+
+@app.patch("/auth/profile")
+def update_profile(req: ProfileUpdate, user_id: int = Depends(get_current_user)):
+    if req.name and not _NAME_RE.match(req.name.strip()):
+        raise HTTPException(400, "Name contains invalid characters")
+    if req.company_url and not _URL_RE.match(req.company_url.strip()):
+        raise HTTPException(400, "Company URL must start with http:// or https://")
+    updated = update_user(user_id, req.dict(exclude_none=True))
+    return _profile_public(updated)
+
+
+@app.get("/auth/verify/{token}")
+def verify_email(token: str):
+    ok = verify_user_token(token)
+    title = "Email verified ✓" if ok else "Invalid or expired link"
+    msg = ("Your account is now verified. You can close this tab and return to the app."
+           if ok else "This verification link is invalid or has already been used.")
+    html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#f5f6fa;margin:0">
+      <div style="max-width:460px;margin:80px auto;background:#fff;padding:44px;border-radius:16px;text-align:center">
+        <h2 style="color:#2d3436">{title}</h2>
+        <p style="color:#636e72;line-height:1.6">{msg}</p>
+      </div></body></html>"""
+    return HTMLResponse(content=html)
+
+
+@app.post("/auth/resend-verification")
+def resend_verification(user_id: int = Depends(get_current_user)):
+    user = get_user_by_id(user_id, public=False)
+    if not user:
+        raise HTTPException(404, "User not found")
+    if user.get("email_verified"):
+        return {"status": "already_verified"}
+    token = _secrets.token_urlsafe(24)
+    set_verification_token(user_id, token)
+    sent = _send_verification_email(user["email"], token)
+    return {"status": "sent" if sent else "failed"}
+
+
+# ── Campaigns ─────────────────────────────────────────────────────────────────
+
 @app.post("/campaigns")
-async def create_campaign(req: CampaignRequest):
-    """Create a new campaign or return existing one if same prompt."""
-    existing = get_campaign_by_prompt(req.prompt)
+async def create_campaign(req: CampaignRequest, user_id: int = Depends(get_current_user)):
+    """Create a new campaign (owned by the current user) or return existing one."""
+    existing = get_campaign_by_prompt(req.prompt, user_id)
 
     if existing:
         campaign_id = existing["id"]
         _campaigns[campaign_id] = {
-            "id": campaign_id,
-            "prompt": req.prompt,
-            "status": "existing",
-            "created_at": str(existing.get("created_at", "")),
+            "id": campaign_id, "prompt": req.prompt, "status": "existing",
+            "user_id": user_id, "created_at": str(existing.get("created_at", "")),
         }
         return {
-            "campaign_id": campaign_id,
-            "status": "existing",
-            "existing": True,
+            "campaign_id": campaign_id, "status": "existing", "existing": True,
             "leads_count": existing.get("leads_count", 0),
         }
 
-    campaign_id = _generate_campaign_id(req.prompt)
+    campaign_id = _generate_campaign_id(req.prompt, user_id)
     _campaigns[campaign_id] = {
-        "id": campaign_id,
-        "prompt": req.prompt,
-        "status": "pending",
-        "created_at": datetime.now().isoformat(),
+        "id": campaign_id, "prompt": req.prompt, "status": "pending",
+        "user_id": user_id, "created_at": datetime.now().isoformat(),
     }
-
     return {"campaign_id": campaign_id, "status": "pending", "existing": False}
 
 
 @app.get("/campaigns")
-def list_campaigns():
-    """Return all campaigns from DB with lead counts."""
-    campaigns = get_all_campaigns()
+def list_campaigns(user_id: int = Depends(get_current_user)):
+    """Return the current user's campaigns from DB with lead counts."""
+    campaigns = get_all_campaigns(user_id)
 
     # Parse datetime fields for JSON serialization
     for c in campaigns:
@@ -207,9 +389,9 @@ def get_campaign(campaign_id: str):
 
 
 @app.get("/campaigns/{campaign_id}/leads")
-def get_campaign_leads_endpoint(campaign_id: str):
-    """Return all leads for a specific campaign."""
-    leads = get_campaign_leads(campaign_id)
+def get_campaign_leads_endpoint(campaign_id: str, user_id: int = Depends(get_current_user)):
+    """Return all leads for a specific campaign (owned by the current user)."""
+    leads = get_campaign_leads(campaign_id, user_id)
 
     for lead in leads:
         for field in ["insights", "draft_email"]:
@@ -226,11 +408,11 @@ def get_campaign_leads_endpoint(campaign_id: str):
 
 
 @app.get("/leads")
-def list_leads(campaign_id: Optional[str] = None):
+def list_leads(campaign_id: Optional[str] = None, user_id: int = Depends(get_current_user)):
     if campaign_id:
-        leads = get_campaign_leads(campaign_id)
+        leads = get_campaign_leads(campaign_id, user_id)
     else:
-        leads = get_all_leads()
+        leads = get_all_leads(user_id=user_id)
 
     # Parse JSON fields + serialize datetimes
     for lead in leads:
@@ -266,6 +448,21 @@ def delete_lead(lead_id: str):
     """RGPD Art. 17 — erase all personal data for this lead across every store."""
     result = delete_lead_completely(lead_id)
     return {"status": "deleted", "erased": result}
+
+
+@app.post("/leads/reply-scores")
+def reply_scores(user_id: int = Depends(get_current_user)):
+    """ML: predicted reply probability (0-100) for each of the user's leads."""
+    try:
+        from ml.reply_scorer import predict_scores, is_available
+    except Exception as e:
+        return {"available": False, "scores": {}, "error": str(e)}
+    if not is_available():
+        return {"available": False, "scores": {}}
+    leads = get_all_leads(user_id=user_id)
+    scores = predict_scores(leads)
+    # available only if the model actually loaded & produced scores (else broken/mismatch)
+    return {"available": bool(scores), "scores": scores}
 
 
 def _apply_segment_rules(lead: dict) -> None:
@@ -758,6 +955,7 @@ async def pipeline_ws(websocket: WebSocket, campaign_id: str):
 
     campaign = _campaigns[campaign_id]
     prompt = campaign["prompt"]
+    owner_id = campaign.get("user_id")   # scope pipeline data to the campaign owner
     campaign["status"] = "running"
 
     async def send(msg_type: str, data: dict):
@@ -769,7 +967,7 @@ async def pipeline_ws(websocket: WebSocket, campaign_id: str):
     # Run pipeline in thread, capture stdout for live streaming
     def run_pipeline():
         pipeline = build_pipeline()
-        result = pipeline.invoke({"campaign_prompt": prompt})
+        result = pipeline.invoke({"campaign_prompt": prompt, "user_id": owner_id})
         return result
 
     # We run the pipeline in a thread and stream stdout lines via WS

@@ -1,6 +1,6 @@
 // frontend/src/App.jsx
 import React, { useState, useCallback, useEffect, useRef, createContext, useContext } from "react";
-import { BrowserRouter, Routes, Route, useNavigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, useNavigate, Navigate } from "react-router-dom";
 import Layout from "./components/Layout";
 import CampaignPage from "./pages/CampaignPage";
 import PipelinePage from "./pages/PipelinePage";
@@ -8,11 +8,85 @@ import LeadsPage from "./pages/LeadsPage";
 import AnalyticsPage from "./pages/AnalyticsPage";
 import InboxPage from "./pages/InboxPage";
 import ExclusionsPage from "./pages/ExclusionsPage";
+import SettingsPage from "./pages/SettingsPage";
+import AuthPage from "./pages/AuthPage";
+import { AuthProvider, useAuth } from "./context/AuthContext";
+import { resendVerification } from "./api/auth";
 import usePipeline from "./hooks/usePipeline";
 import useCampaigns from "./hooks/useCampaigns";
 import { getLeads } from "./api/leads";
+import logo from "./theleadflowlogo.png";
 import { darkTheme, lightTheme } from "./styles/theme";
 import "./styles/global.css";
+
+// ── Verify-email gate (blocks the app until the email is verified) ─────────────
+function VerifyGate() {
+  const { theme } = useTheme();
+  const c = theme.colors;
+  const { user, logout, refreshUser } = useAuth();
+  const navigate = useNavigate();
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const resend = async () => {
+    setMsg("Sending…");
+    try { const r = await resendVerification(); setMsg(r.status === "sent" ? "Verification email sent ✓" : r.status === "already_verified" ? "Already verified — refresh below" : "Failed to send"); }
+    catch { setMsg("Failed to send"); }
+  };
+  const check = async () => {
+    setBusy(true); setMsg(null);
+    try {
+      const me = await refreshUser();
+      if (!me.email_verified) setMsg("Still not verified — click the link in your email first.");
+    } catch { setMsg("Could not check status"); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+      background: `radial-gradient(1200px 600px at 50% -10%, ${c.accentGlow}, ${c.bg})`, padding: 20,
+    }}>
+      <div style={{
+        width: 420, maxWidth: "100%", background: c.surface, border: `1px solid ${c.border}`,
+        borderRadius: 18, padding: "36px 32px", textAlign: "center", boxShadow: "0 20px 60px rgba(0,0,0,0.15)",
+      }}>
+        <img src={logo} alt="TheLeadFlow" style={{ height: 42, borderRadius: 10, marginBottom: 14 }} />
+        <div style={{ fontSize: 40, marginBottom: 8 }}>📧</div>
+        <h2 style={{ color: c.text, margin: "0 0 8px" }}>Verify your email</h2>
+        <p style={{ color: c.textDim, fontSize: 14, lineHeight: 1.6 }}>
+          You must verify your email before using TheLeadFlow. We sent a link to{" "}
+          <b style={{ color: c.text }}>{user?.email}</b>. Click it, then press refresh.
+        </p>
+        {msg && <div style={{ fontSize: 13, color: c.accent, marginTop: 12 }}>{msg}</div>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 22 }}>
+          <button onClick={check} disabled={busy} style={{
+            padding: "12px 0", borderRadius: 10, border: "none", background: c.accent, color: "#fff",
+            fontWeight: 600, fontSize: 14, cursor: busy ? "not-allowed" : "pointer", opacity: busy ? 0.6 : 1,
+          }}>{busy ? "Checking…" : "I've verified — refresh"}</button>
+          <button onClick={resend} style={{
+            padding: "10px 0", borderRadius: 10, border: `1px solid ${c.border}`, background: "transparent",
+            color: c.textMuted, fontWeight: 600, fontSize: 13, cursor: "pointer",
+          }}>Resend verification email</button>
+          <button onClick={() => { logout(); navigate("/login"); }} style={{
+            padding: "6px 0", background: "none", border: "none", color: c.textDim, fontSize: 12, cursor: "pointer",
+          }}>Sign out</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Route protection ──────────────────────────────────────────────────────────
+function RequireAuth({ children }) {
+  const { isAuthenticated, loading, user } = useAuth();
+  if (loading) {
+    return <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: "#888" }}>Loading…</div>;
+  }
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (user && !user.email_verified) return <VerifyGate />;
+  return children;
+}
 
 // ── Theme context ────────────────────────────────────────────────────────────
 export const ThemeContext = createContext();
@@ -51,9 +125,11 @@ function AppRoutes() {
     prevIsRunning.current = isRunning;
     if (justFinished && leads.length > 0) {
       fetchCampaigns();
+      // Show the freshly-run campaign as the selected one (not "Latest pipeline results")
+      if (campaignId) setActiveCampaignId(campaignId);
       navigate("/leads");
     }
-  }, [isRunning, leads.length, fetchCampaigns, navigate]);
+  }, [isRunning, leads.length, campaignId, fetchCampaigns, navigate]);
 
   const handleUpdateLead = useCallback(
     (leadId, updates) => {
@@ -66,12 +142,24 @@ function AppRoutes() {
     [setLeads]
   );
 
-  const activeCampaign = activeCampaignId
+  const ALL = "__all__";
+  const allLeadsView = activeCampaignId === ALL;
+  const activeCampaign = activeCampaignId && !allLeadsView
     ? campaigns.find((c) => c.id === activeCampaignId)
     : null;
 
+  // View every lead across all campaigns
+  const handleViewAll = useCallback(async () => {
+    try {
+      const data = await getLeads();
+      setLeads(data.leads || []);
+    } catch {}
+    setActiveCampaignId(ALL);
+    navigate("/leads");
+  }, [setLeads, navigate]);
+
   const handleRefresh = useCallback(async () => {
-    if (activeCampaignId) {
+    if (activeCampaignId && activeCampaignId !== ALL) {
       const fresh = await loadCampaignLeads(activeCampaignId);
       setLeads(fresh);
     } else {
@@ -85,13 +173,16 @@ function AppRoutes() {
 
   return (
     <Routes>
-      <Route element={<Layout isRunning={isRunning} leadsCount={leads.length} />}>
+      <Route path="/login" element={<AuthPage mode="login" />} />
+      <Route path="/register" element={<AuthPage mode="register" />} />
+      <Route element={<RequireAuth><Layout isRunning={isRunning} leadsCount={leads.length} /></RequireAuth>}>
         <Route index element={<CampaignPage onLaunch={handleLaunch} onViewCampaign={handleViewCampaign} isRunning={isRunning} campaigns={campaigns} campaignsLoading={campaignsLoading} />} />
         <Route path="pipeline" element={<PipelinePage currentStage={currentStage} logs={logs} isRunning={isRunning} />} />
-        <Route path="leads" element={<LeadsPage leads={leads} onUpdateLead={handleUpdateLead} activeCampaign={activeCampaign} campaigns={campaigns} onViewCampaign={handleViewCampaign} onRefresh={handleRefresh} />} />
+        <Route path="leads" element={<LeadsPage leads={leads} onUpdateLead={handleUpdateLead} activeCampaign={activeCampaign} campaigns={campaigns} onViewCampaign={handleViewCampaign} onRefresh={handleRefresh} onViewAll={handleViewAll} allLeadsView={allLeadsView} />} />
         <Route path="inbox" element={<InboxPage />} />
         <Route path="analytics" element={<AnalyticsPage leads={leads} campaigns={campaigns} activeCampaign={activeCampaign} />} />
         <Route path="exclusions" element={<ExclusionsPage />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
     </Routes>
   );
@@ -108,7 +199,9 @@ export default function App() {
   return (
     <ThemeContext.Provider value={{ theme, isDark, toggleTheme }}>
       <BrowserRouter>
-        <AppRoutes />
+        <AuthProvider>
+          <AppRoutes />
+        </AuthProvider>
       </BrowserRouter>
     </ThemeContext.Provider>
   );

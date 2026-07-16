@@ -17,6 +17,7 @@ from utils.json_utils import extract_json_list
 
 class LeadPipelineState(TypedDict):
     campaign_prompt: str
+    user_id:         Optional[int]
     criteria:        dict
     raw_leads_json:  str
     raw_leads:       list
@@ -67,7 +68,7 @@ def save_raw_leads_node(state: LeadPipelineState) -> dict:
     if not raw_leads:
         print("[Storage] ⚠ No leads parsed from Agent 1 output.")
         return {"raw_leads": [], "save_summary": {}}
-    summary = save_leads(raw_leads, state["campaign_prompt"])
+    summary = save_leads(raw_leads, state["campaign_prompt"], state.get("user_id"))
     print(f"\n[Agent 1] Processed {summary['total']} leads "
           f"({summary['added']} new, {summary['duplicates']} duplicates)")
     return {"raw_leads": raw_leads, "save_summary": summary}
@@ -97,7 +98,7 @@ def save_qualified_leads_node(state: LeadPipelineState) -> dict:
     if not qualified:
         return {}
     if "qualifier" not in state.get("skipped_agents", []):
-        update_lead_qualification(qualified)
+        update_lead_qualification(qualified, state.get("user_id"))
     hot  = [l for l in qualified if l.get("segment") == "hot"]
     warm = [l for l in qualified if l.get("segment") == "warm"]
     cold = [l for l in qualified if l.get("segment") == "cold"]
@@ -134,10 +135,25 @@ def generate_emails_node(state: LeadPipelineState) -> dict:
         print(f"[Agent 4] ⚠ Running with degraded data (skipped: {', '.join(skipped_agents)})")
 
     try:
-        from memory.storage import get_sender_config
-        sender_info = get_sender_config(default_only=True) or {}
+        from memory.storage import get_sender_config, get_user_by_id
+        # Prefer the campaign owner's profile as the email sender identity
+        sender_info = {}
+        uid = state.get("user_id")
+        if uid:
+            u = get_user_by_id(uid) or {}
+            sender_info = {
+                "name": u.get("name") or "", "title": u.get("role") or "",
+                "company": u.get("company") or "", "email": u.get("email") or "",
+                "company_description": u.get("company_description") or "",
+                "company_url": u.get("company_url") or "",
+                "company_location": u.get("company_location") or "",
+                "company_size": u.get("company_size") or "",
+                "signature": u.get("signature") or "",
+            }
+        if not sender_info.get("name"):
+            sender_info = get_sender_config(default_only=True) or sender_info
         with_emails = run_email_generator(enriched, state["campaign_prompt"], sender_info)
-        save_enrichment_results(with_emails)
+        save_enrichment_results(with_emails, state.get("user_id"))
 
         generated = [l for l in with_emails if l.get("draft_email")]
         skipped   = [l for l in with_emails if not l.get("draft_email")]
@@ -156,7 +172,7 @@ def generate_emails_node(state: LeadPipelineState) -> dict:
     except Exception as exc:
         print(f"[!] Agent 4 failed: {exc}")
         print("[!] FALLBACK → Saving leads without draft emails.")
-        save_enrichment_results(enriched)
+        save_enrichment_results(enriched, state.get("user_id"))
         skipped = state.get("skipped_agents", []) + ["writer"]
         return {"skipped_agents": skipped}
 

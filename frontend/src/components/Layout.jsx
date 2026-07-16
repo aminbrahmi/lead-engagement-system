@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import logo from "../theleadflowlogo.png";
 import { useTheme } from "../App";
+import { useAuth } from "../context/AuthContext";
 
 const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
 
@@ -223,33 +224,99 @@ const NAV = [
   { to: "/exclusions", label: "Exclusions" },
 ];
 
-function ThemeToggle() {
-  const { isDark, toggleTheme, theme } = useTheme();
+
+function UserMenu() {
+  const { theme, isDark, toggleTheme } = useTheme();
   const c = theme.colors;
+  const f = theme.fonts;
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const h = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, [open]);
+
+  const initial = (user?.name || user?.email || "?").trim()[0]?.toUpperCase() || "?";
+
   return (
-    <button
-      onClick={toggleTheme}
-      aria-label="Toggle theme"
-      style={{
-        width: 44, height: 24, borderRadius: 12, border: `1px solid ${c.border}`,
-        background: c.surfaceAlt, cursor: "pointer", position: "relative", padding: 0,
-        transition: "background .3s",
-      }}
-    >
-      <div style={{
-        width: 18, height: 18, borderRadius: 9,
-        background: isDark ? c.accent : c.warm,
-        position: "absolute", top: 2,
-        left: isDark ? 22 : 3,
-        transition: "left .3s, background .3s",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        fontSize: 10,
+    <div ref={ref} style={{ position: "relative" }}>
+      <button onClick={() => setOpen((o) => !o)} title={user?.email} style={{
+        width: 32, height: 32, borderRadius: 16, border: `1px solid ${c.border}`,
+        background: c.accentGlow, color: c.accent, fontWeight: 700, fontSize: 13,
+        cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+        overflow: "hidden", padding: 0,
       }}>
-        {isDark ? "\u263D" : "\u2600"}
-      </div>
-    </button>
+        {user?.photo_url
+          ? <img src={user.photo_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+          : initial}
+      </button>
+
+      {open && (
+        <div style={{
+          position: "absolute", top: "calc(100% + 8px)", right: 0, width: 220,
+          background: c.surface, border: `1px solid ${c.border}`, borderRadius: 12,
+          boxShadow: "0 12px 40px rgba(0,0,0,0.18)", zIndex: 200, overflow: "hidden",
+        }}>
+          <div style={{ padding: "12px 14px", borderBottom: `1px solid ${c.border}` }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: c.text }}>{user?.name || "Account"}</div>
+            <div style={{ fontSize: 12, color: c.textDim, wordBreak: "break-all" }}>{user?.email}</div>
+            {user && (
+              <div style={{ marginTop: 6, fontSize: 11, fontWeight: 600,
+                color: user.email_verified ? c.green : c.warm }}>
+                {user.email_verified ? "✓ Email verified" : "● Email not verified"}
+              </div>
+            )}
+          </div>
+          <button
+            onClick={() => { setOpen(false); navigate("/settings"); }}
+            style={{
+              width: "100%", textAlign: "left", padding: "11px 14px", border: "none",
+              background: "transparent", color: c.text, fontSize: 13, fontWeight: 500,
+              cursor: "pointer", fontFamily: f.body,
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.background = c.surfaceHover || c.surfaceAlt}
+            onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+          >
+            ⚙ Account settings
+          </button>
+          <button
+            onClick={toggleTheme}
+            style={{
+              width: "100%", padding: "11px 14px", border: "none",
+              borderTop: `1px solid ${c.border}`, background: "transparent",
+              color: c.text, fontSize: 13, fontWeight: 500, cursor: "pointer",
+              fontFamily: f.body, display: "flex", alignItems: "center", justifyContent: "space-between",
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.background = c.surfaceHover || c.surfaceAlt}
+            onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+          >
+            <span>{isDark ? "Dark mode" : "Light mode"}</span>
+            <span style={{ fontSize: 15 }}>{isDark ? "☾" : "☀"}</span>
+          </button>
+          <button
+            onClick={() => { logout(); navigate("/login"); }}
+            style={{
+              width: "100%", textAlign: "left", padding: "11px 14px", border: "none",
+              borderTop: `1px solid ${c.border}`,
+              background: "transparent", color: c.hot, fontSize: 13, fontWeight: 600,
+              cursor: "pointer", fontFamily: f.body,
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.background = c.surfaceHover || c.surfaceAlt}
+            onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+          >
+            Sign out
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
+
 
 export default function Layout({ isRunning, leadsCount }) {
   const { theme } = useTheme();
@@ -267,13 +334,18 @@ export default function Layout({ isRunning, leadsCount }) {
         background: c.surface, position: "sticky", top: 0, zIndex: 50,
         transition: "background .3s",
       }}>
-        {/* Logo */}
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        {/* Logo → Campaign page */}
+        <NavLink
+          to="/"
+          end
+          style={{ display: "flex", alignItems: "center", gap: 10, textDecoration: "none", cursor: "pointer" }}
+          title="Go to Campaign page"
+        >
           <img src={logo} alt="TheLeadFlow" style={{ height: 32, width: "auto", borderRadius: 8 }} />
           <span style={{ fontSize: 18, fontWeight: 700, color: c.text, fontFamily: f.body, letterSpacing: -0.3 }}>
             TheLeadFlow
           </span>
-        </div>
+        </NavLink>
 
         {/* Nav */}
         <nav style={{ display: "flex", gap: 4, height: "100%" }}>
@@ -300,13 +372,13 @@ export default function Layout({ isRunning, leadsCount }) {
           ))}
         </nav>
 
-        {/* Right: status + notifications + toggle */}
+        {/* Right: status + notifications + toggle + user */}
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           {isRunning && (
             <span style={{ fontSize: 11, color: c.accent, fontFamily: f.mono, animation: "pulse 1.5s infinite" }}>Running</span>
           )}
           <NotificationBell />
-          <ThemeToggle />
+          <UserMenu />
         </div>
       </header>
 

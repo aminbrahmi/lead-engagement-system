@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useTheme } from "../App";
 import { getDiscussions, getThread, runTracker, getLeadDiscussion, sendDiscussionReply, generateDiscussionReply } from "../api/discussions";
+import { getCampaigns } from "../api/campaigns";
 
 const SENTIMENT_META = {
   interested:     { label: "Interested",     color: "#00b894", bg: "rgba(0,184,148,0.12)" },
@@ -627,6 +628,8 @@ export default function InboxPage() {
   const [checkResult, setCheckResult]     = useState(null);
   const [newReplyBanner, setNewReplyBanner] = useState(false);
   const [showMeetModal, setShowMeetModal] = useState(false);
+  const [campaigns, setCampaigns]         = useState([]);
+  const [campaignFilter, setCampaignFilter] = useState("");   // "" = all campaigns
 
   const messagesEndRef  = useRef(null);
   const prevMsgCount    = useRef(0);
@@ -680,6 +683,7 @@ export default function InboxPage() {
   // ── Initial load ─────────────────────────────────────────────────────────
   useEffect(() => {
     fetchDiscussions();
+    getCampaigns().then((res) => setCampaigns(res.campaigns || [])).catch(() => {});
   }, []); // intentionally empty — runs once on mount
 
   // ── Open discussion from ?open=<lead_id> param — runs on EVERY param change
@@ -741,7 +745,13 @@ export default function InboxPage() {
     }
   };
 
-  const repliedCount = discussions.filter((d) => d.has_reply).length;
+  // Filter discussions by selected campaign (client-side; d.campaign_id comes from d.*)
+  const visibleDiscussions = campaignFilter
+    ? discussions.filter((d) => String(d.campaign_id) === String(campaignFilter))
+    : discussions;
+  const repliedCount = visibleDiscussions.filter((d) => d.has_reply).length;
+
+  const truncate = (s, n = 42) => (s && s.length > n ? s.slice(0, n) + "…" : s || "");
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 114px)" }}>
@@ -754,7 +764,7 @@ export default function InboxPage() {
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <h2 style={{ fontSize: 20, fontWeight: 700, color: c.text, margin: 0 }}>Inbox</h2>
           <span style={{ fontSize: 12, color: c.textDim, fontFamily: f.mono }}>
-            {discussions.length} conversation{discussions.length !== 1 ? "s" : ""}
+            {visibleDiscussions.length} conversation{visibleDiscussions.length !== 1 ? "s" : ""}
           </span>
           {repliedCount > 0 && (
             <span style={{
@@ -767,6 +777,22 @@ export default function InboxPage() {
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {/* Campaign filter */}
+          <select
+            value={campaignFilter}
+            onChange={(e) => setCampaignFilter(e.target.value)}
+            title="Filter by campaign"
+            style={{
+              padding: "7px 12px", borderRadius: 8, border: `1px solid ${c.border}`,
+              background: c.surface, color: c.text, fontSize: 12, fontFamily: f.body,
+              cursor: "pointer", maxWidth: 260,
+            }}
+          >
+            <option value="">All campaigns</option>
+            {campaigns.map((camp) => (
+              <option key={camp.id} value={camp.id}>{truncate(camp.prompt || camp.id, 40)}</option>
+            ))}
+          </select>
           {checkResult && !checkResult.error && (
             <span style={{ fontSize: 12, color: c.green, fontFamily: f.mono }}>
               {checkResult.replies_found ?? 0} scanned · {checkResult.matched ?? 0} matched
@@ -808,15 +834,17 @@ export default function InboxPage() {
             <div style={{ padding: 32, textAlign: "center", color: c.textDim, fontSize: 13 }}>
               Loading…
             </div>
-          ) : discussions.length === 0 ? (
+          ) : visibleDiscussions.length === 0 ? (
             <div style={{
               padding: 32, textAlign: "center",
               color: c.textDim, fontSize: 13, lineHeight: 1.9,
             }}>
-              No conversations yet.<br />Send an email to a lead to start one.
+              {campaignFilter
+                ? <>No conversations for this campaign.</>
+                : <>No conversations yet.<br />Send an email to a lead to start one.</>}
             </div>
           ) : (
-            discussions.map((d) => (
+            visibleDiscussions.map((d) => (
               <DiscussionItem
                 key={d.id}
                 disc={d}

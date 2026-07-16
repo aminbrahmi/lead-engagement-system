@@ -54,3 +54,6 @@ input:focus, textarea:focus {
 header, main, div, span, p, h1, h2, h3, h4, button, input, textarea, table, td, th, tr {
   transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
 }
+
+/* Auth split layout — hide the description panel on small screens */
+@media (max-width: 820px) { .auth-left { display: none !important; } }

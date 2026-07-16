@@ -1,17 +1,37 @@
 // src/pages/LeadsPage.jsx
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import LeadTable from "../components/LeadTable";
 import LeadDetail from "../components/LeadDetail";
 import { useTheme } from "../App";
 import { updateDraftEmail } from "../api/email";
-import { updateLeadFields } from "../api/leads";
+import { updateLeadFields, getReplyScores } from "../api/leads";
 
-export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaigns, onViewCampaign, onRefresh }) {
+export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaigns, onViewCampaign, onRefresh, onViewAll, allLeadsView }) {
   const { theme } = useTheme();
   const c = theme.colors;
   const f = theme.fonts;
   const [selected, setSelected] = useState(null);
   const [showDropdown, setShowDropdown] = useState(false);
+  const [replyScores, setReplyScores] = useState(null);   // { id: pct } or null if model unavailable
+  const detailRef = useRef(null);
+
+  // Scroll to the detail section when a lead is opened
+  useEffect(() => {
+    if (selected) {
+      // wait a tick so the detail is mounted, then scroll into view
+      requestAnimationFrame(() => detailRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    }
+  }, [selected?.id]);
+
+  // Fetch ML reply-probability scores when the lead set changes
+  useEffect(() => {
+    if (!leads.length) { setReplyScores(null); return; }
+    let active = true;
+    getReplyScores()
+      .then((res) => { if (active) setReplyScores(res.available ? (res.scores || {}) : null); })
+      .catch(() => { if (active) setReplyScores(null); });
+    return () => { active = false; };
+  }, [leads.length]);
 
   // Wraps the global onUpdateLead: also updates `selected` and persists to DB
   const handleUpdateLead = async (leadId, updates) => {
@@ -55,7 +75,8 @@ export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaig
   const truncate = (str, len = 60) =>
     str && str.length > len ? str.slice(0, len) + "..." : str || "";
 
-  if (leads.length === 0) {
+  // Fully empty + nothing to browse → simple onboarding message
+  if (leads.length === 0 && (!campaigns || campaigns.length === 0)) {
     return (
       <div style={{ textAlign: "center", padding: 80, color: c.textDim }}>
         <p style={{ fontSize: 40, marginBottom: 16 }}>&#128101;</p>
@@ -71,9 +92,25 @@ export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaig
         display: "flex", alignItems: "center", justifyContent: "space-between",
         flexWrap: "wrap", gap: 12,
       }}>
-        {/* Left: active campaign info */}
+        {/* Left: active view info */}
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {activeCampaign ? (
+          {allLeadsView ? (
+            <>
+              <span style={{
+                fontSize: 10, padding: "3px 8px", borderRadius: 4,
+                background: c.accentGlow, color: c.accent,
+                fontFamily: f.mono, fontWeight: 600, textTransform: "uppercase",
+              }}>
+                All leads
+              </span>
+              <span style={{ fontSize: 14, fontWeight: 500, color: c.text }}>
+                Every lead across all campaigns
+              </span>
+              <span style={{ fontSize: 12, color: c.textDim, fontFamily: f.mono }}>
+                {leads.length} leads
+              </span>
+            </>
+          ) : activeCampaign ? (
             <>
               <span style={{
                 fontSize: 10, padding: "3px 8px", borderRadius: 4,
@@ -96,8 +133,25 @@ export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaig
           )}
         </div>
 
-        {/* Right: refresh + campaign switcher */}
+        {/* Right: all-leads + refresh + campaign switcher */}
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        {onViewAll && (
+          <button
+            onClick={onViewAll}
+            style={{
+              padding: "6px 14px", borderRadius: 6,
+              border: `1px solid ${allLeadsView ? c.accent : c.border}`,
+              background: allLeadsView ? c.accentGlow : c.surface,
+              color: allLeadsView ? c.accent : c.textMuted,
+              fontSize: 12, cursor: "pointer", fontFamily: f.body,
+              fontWeight: allLeadsView ? 600 : 500, display: "flex",
+              alignItems: "center", gap: 6,
+            }}
+            title="Show every lead across all campaigns"
+          >
+            All leads
+          </button>
+        )}
         {onRefresh && (
           <button
             onClick={onRefresh}
@@ -189,26 +243,39 @@ export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaig
         </div>
       </div>
 
-      {/* ── Lead table ── */}
-      <LeadTable
-        leads={leads}
-        onSelect={setSelected}
-        selectedId={selected?.id}
-        onDelete={(id) => {
-          if (selected?.id === id) setSelected(null);
-          onUpdateLead(id, { _deleted: true });
-        }}
-      />
+      {/* ── Lead table (or empty notice for this view) ── */}
+      {leads.length === 0 ? (
+        <div style={{
+          textAlign: "center", padding: 60, color: c.textDim,
+          background: c.surface, border: `1px solid ${c.border}`, borderRadius: 14,
+        }}>
+          <p style={{ fontSize: 32, marginBottom: 12 }}>&#128101;</p>
+          <p>No leads in this view. Try <strong>All leads</strong> or switch campaign.</p>
+        </div>
+      ) : (
+        <LeadTable
+          leads={leads}
+          replyScores={replyScores}
+          onSelect={setSelected}
+          selectedId={selected?.id}
+          onDelete={(id) => {
+            if (selected?.id === id) setSelected(null);
+            onUpdateLead(id, { _deleted: true });
+          }}
+        />
+      )}
 
       {/* ── Lead detail ── */}
       {selected && (
-        <LeadDetail
-          lead={selected}
-          campaignId={activeCampaign?.id || selected?.campaign}
-          onClose={() => setSelected(null)}
-          onUpdateEmail={handleUpdateEmail}
-          onUpdateLead={handleUpdateLead}
-        />
+        <div ref={detailRef} style={{ scrollMarginTop: 80 }}>
+          <LeadDetail
+            lead={selected}
+            campaignId={activeCampaign?.id || selected?.campaign}
+            onClose={() => setSelected(null)}
+            onUpdateEmail={handleUpdateEmail}
+            onUpdateLead={handleUpdateLead}
+          />
+        </div>
       )}
     </div>
   );
