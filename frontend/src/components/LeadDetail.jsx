@@ -112,7 +112,6 @@ export default function LeadDetail({ lead, campaignId, onClose, onUpdateEmail, o
         </div>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ textAlign: "right" }}>
-            <div style={{ fontFamily: f.mono, fontSize: 28, fontWeight: 700, color: segmentColor(lead.segment, theme) }}>{lead.score}</div>
             <Badge segment={lead.segment} />
           </div>
           {/* Re-enrich: re-run research, regenerate emails, auto-score */}

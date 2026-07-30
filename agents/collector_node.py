@@ -4,6 +4,7 @@ collector_node.py — fast path: parallel Tavily searches → single LLM extract
 
 import json
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -11,7 +12,58 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.llm_factory import get_collector_llm
 from orchestration.prompts import COLLECTOR_SYSTEM
-from utils.json_utils import detect_truncation
+from utils.json_utils import detect_truncation, extract_json_list
+
+
+# ── Anti-hallucination guard ──────────────────────────────────────────────────
+
+def _norm(s: str) -> str:
+    """Lowercase, strip accents, keep letters/spaces — for robust text matching."""
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z ]+", " ", s.lower()).strip()
+
+
+def _name_grounded(name: str, blob_norm: str) -> bool:
+    """True if the person's name is actually present in the search results.
+    Requires every significant token (esp. the surname) to appear — this catches
+    names the LLM invented or copied from another company."""
+    n = _norm(name)
+    if not n or n == "unknown":
+        return True
+    if n in blob_norm:
+        return True
+    toks = [t for t in n.split() if len(t) > 1]
+    return bool(toks) and all(t in blob_norm for t in toks)
+
+
+def _validate_leads(content: str, search_blob: str) -> str:
+    """Post-process the LLM extraction: drop hallucinated names.
+
+    1. A name that doesn't appear in the search results → 'unknown'.
+    2. The same person reused across different companies → 'unknown' on the extras
+       (classic LLM hallucination — it latches onto one plausible name).
+    The company/email are kept; only the fabricated name is cleared.
+    """
+    leads = extract_json_list(content, context="Collector validation")
+    if not leads:
+        return content
+    blob_norm = _norm(search_blob)
+    seen = {}          # normalized name -> normalized company it first appeared with
+    cleared = 0
+    for lead in leads:
+        name = (lead.get("name") or "").strip()
+        if not name or name.lower() == "unknown":
+            continue
+        if not _name_grounded(name, blob_norm):
+            lead["name"] = "unknown"; cleared += 1; continue
+        key, company = _norm(name), _norm(lead.get("company"))
+        if key in seen and seen[key] != company:
+            lead["name"] = "unknown"; cleared += 1      # same person, other company
+        else:
+            seen[key] = company
+    if cleared:
+        print(f"[Collector] ⚠ Grounding guard cleared {cleared} hallucinated name(s) → 'unknown'")
+    return json.dumps(leads, ensure_ascii=False)
 
 
 # ── Tavily parallel search ────────────────────────────────────────────────────
@@ -85,6 +137,9 @@ Return ONLY a raw JSON array (no markdown fences):
 
 Rules:
 - Each company must be UNIQUE — no duplicates.
+- The "name" MUST appear verbatim in the search results above, next to that
+  company. If no person is named for a company, use "name": "unknown".
+- NEVER invent a name, and NEVER reuse the same person for two companies.
 - No platform names as companies (LinkedIn, Crunchbase, etc.).
 - source_url must be a real article — never a search/social feed URL.
 - Minimum 5 leads, aim for 10.
@@ -136,11 +191,10 @@ def run_collector(campaign_prompt: str, criteria: dict) -> str:
         # Quick check: does it contain a JSON array?
         if content and ("[" in content):
             # Try to parse immediately to verify it's valid
-            from utils.json_utils import extract_json_list
             test_parse = extract_json_list(content, context=f"Collector attempt {attempt}")
             if test_parse:
                 print(f"[Collector] ✓ Extracted {len(test_parse)} leads")
-                return content
+                return _validate_leads(content, search_blob)
             else:
                 print(f"[Collector] ⚠ Found '[' but extraction failed")
                 if attempt < 2:

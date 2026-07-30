@@ -3,8 +3,12 @@ analyst_pdf.py — render Analyst reports to PDF (reportlab, with charts).
 """
 
 import io
+import os
+import unicodedata
 from datetime import datetime
 
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -29,15 +33,76 @@ MUTE   = colors.HexColor("#636e72")
 LIGHT  = colors.HexColor("#f5f6fa")
 
 
+# ── Unicode-capable font ──────────────────────────────────────────────────────
+# reportlab's built-in Helvetica can't render typographic glyphs (—, →, ★, ·):
+# they come out as black boxes. Register a real TrueType font so everything shows.
+BASE_FONT, BOLD_FONT = "Helvetica", "Helvetica-Bold"
+
+
+def _register_unicode_font():
+    global BASE_FONT, BOLD_FONT
+    candidates = [
+        (r"C:\Windows\Fonts\arial.ttf",  r"C:\Windows\Fonts\arialbd.ttf"),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/Library/Fonts/Arial.ttf", "/Library/Fonts/Arial Bold.ttf"),
+    ]
+    for reg, regb in candidates:
+        try:
+            if os.path.exists(reg) and os.path.exists(regb):
+                pdfmetrics.registerFont(TTFont("AppSans", reg))
+                pdfmetrics.registerFont(TTFont("AppSans-Bold", regb))
+                pdfmetrics.registerFontFamily(
+                    "AppSans", normal="AppSans", bold="AppSans-Bold",
+                    italic="AppSans", boldItalic="AppSans-Bold")
+                BASE_FONT, BOLD_FONT = "AppSans", "AppSans-Bold"
+                return
+        except Exception:
+            continue
+
+
+_register_unicode_font()
+
+# Safety net: if no Unicode font could be registered, downgrade typographic
+# characters to ASCII so the fallback Helvetica never prints black boxes.
+_ASCII_MAP = {
+    "—": "-", "–": "-", "−": "-", "→": "->", "←": "<-",
+    "★": "*", "☆": "*", "•": "-", "·": "-",
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "…": "...", " ": " ",
+}
+
+
+def _txt(s):
+    """Fold typographic glyphs that fonts may lack (every dash variant, arrows,
+    stars, bullets, smart quotes) down to plain ASCII, so the PDF never renders a
+    missing-glyph box. Applied unconditionally, regardless of the active font."""
+    if not isinstance(s, str):
+        return s
+    out = []
+    for ch in s:
+        if ch in _ASCII_MAP:
+            out.append(_ASCII_MAP[ch])
+        elif ord(ch) > 127 and unicodedata.category(ch) == "Pd":
+            out.append("-")            # any Unicode dash/hyphen → ASCII hyphen
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _styles():
     ss = getSampleStyleSheet()
-    ss.add(ParagraphStyle("H1b", parent=ss["Title"], textColor=INK, fontSize=22, spaceAfter=4))
-    ss.add(ParagraphStyle("Sub", parent=ss["Normal"], textColor=MUTE, fontSize=10, spaceAfter=2))
+    ss.add(ParagraphStyle("H1b", parent=ss["Title"], textColor=INK, fontSize=22, spaceAfter=4,
+                          fontName=BOLD_FONT))
+    ss.add(ParagraphStyle("Sub", parent=ss["Normal"], textColor=MUTE, fontSize=10, spaceAfter=2,
+                          fontName=BASE_FONT))
     ss.add(ParagraphStyle("H2b", parent=ss["Heading2"], textColor=ACCENT, fontSize=13,
-                          spaceBefore=14, spaceAfter=6))
-    ss.add(ParagraphStyle("Body", parent=ss["Normal"], textColor=INK, fontSize=10, leading=15))
+                          spaceBefore=14, spaceAfter=6, fontName=BOLD_FONT))
+    ss.add(ParagraphStyle("Body", parent=ss["Normal"], textColor=INK, fontSize=10, leading=15,
+                          fontName=BASE_FONT))
     ss.add(ParagraphStyle("Rec", parent=ss["Normal"], textColor=INK, fontSize=10,
-                          leading=15, leftIndent=10, spaceAfter=4, bulletIndent=0))
+                          leading=15, leftIndent=10, spaceAfter=4, bulletIndent=0,
+                          fontName=BASE_FONT))
     return ss
 
 
@@ -61,7 +126,7 @@ def _segment_pie(hot: int, warm: int, cold: int) -> Drawing:
     legend = Legend()
     legend.x, legend.y = 150, 110
     legend.dx, legend.dy = 8, 8
-    legend.fontName, legend.fontSize = "Helvetica", 9
+    legend.fontName, legend.fontSize = BASE_FONT, 9
     legend.alignment = "right"
     legend.colorNamePairs = list(zip(cols, labels))
     d.add(legend)
@@ -114,11 +179,13 @@ def _variant_bars(variants: dict) -> Drawing:
 
 
 def _metric_table(rows, col_widths=None):
+    rows = [[_txt(cell) for cell in row] for row in rows]   # ASCII-safe cells
     t = Table(rows, colWidths=col_widths)
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), ACCENT),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 0), (-1, 0), BOLD_FONT),
+        ("FONTNAME", (0, 1), (-1, -1), BASE_FONT),
         ("FONTSIZE", (0, 0), (-1, -1), 9),
         ("TEXTCOLOR", (0, 1), (-1, -1), INK),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
@@ -132,21 +199,21 @@ def _metric_table(rows, col_widths=None):
 
 
 def _header(elements, ss, title, subtitle):
-    elements.append(Paragraph(title, ss["H1b"]))
-    elements.append(Paragraph(subtitle, ss["Sub"]))
-    elements.append(Paragraph(
-        f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} · TheLeadFlow Analyst", ss["Sub"]))
+    elements.append(Paragraph(_txt(title), ss["H1b"]))
+    elements.append(Paragraph(_txt(subtitle), ss["Sub"]))
+    elements.append(Paragraph(_txt(
+        f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} · TheLeadFlow Analyst"), ss["Sub"]))
     elements.append(Spacer(1, 8))
 
 
 def _recommendations_block(elements, ss, summary, recommendations):
     if summary:
         elements.append(Paragraph("Executive summary", ss["H2b"]))
-        elements.append(Paragraph(summary, ss["Body"]))
+        elements.append(Paragraph(_txt(summary), ss["Body"]))
     if recommendations:
         elements.append(Paragraph("Optimization recommendations", ss["H2b"]))
         for i, rec in enumerate(recommendations, 1):
-            elements.append(Paragraph(f"{i}. {rec}", ss["Rec"]))
+            elements.append(Paragraph(_txt(f"{i}. {rec}"), ss["Rec"]))
 
 
 def build_campaign_pdf(report: dict) -> bytes:

@@ -3,6 +3,7 @@ import React, { useState } from "react";
 import { useTheme } from "../App";
 import { segmentColor } from "../styles/theme";
 import Badge from "./ui/Badge";
+import { authFetch } from "../api/authFetch";
 
 const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
 
@@ -65,13 +66,24 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete, reply
   const c = theme.colors;
   const f = theme.fonts;
   const [filter, setFilter] = useState("all");
-  const [sortBy, setSortBy] = useState("date");   // date | name | score | reply
+  const [sortBy, setSortBy] = useState("date");   // date | name | reply
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
   const [pendingDelete, setPendingDelete] = useState(null);
 
-  const base = filter === "all" ? leads : leads.filter((l) => l.segment === filter);
+  // Distinct statuses present, with "sent" pinned first
+  const statusOptions = Array.from(new Set(leads.map((l) => l.status).filter(Boolean)))
+    .sort((a, b) => (a === "sent" ? -1 : b === "sent" ? 1 : a.localeCompare(b)));
+
+  const q = search.trim().toLowerCase();
+  const segBase = filter === "all" ? leads : leads.filter((l) => l.segment === filter);
+  const statusBase = statusFilter === "all" ? segBase : segBase.filter((l) => l.status === statusFilter);
+  const base = q
+    ? statusBase.filter((l) =>
+        [l.name, l.company, l.email].some((v) => (v || "").toLowerCase().includes(q)))
+    : statusBase;
   const filtered = [...base].sort((a, b) => {
     if (sortBy === "name") return (a.name || "").localeCompare(b.name || "");
-    if (sortBy === "score") return (b.score || 0) - (a.score || 0);
     if (sortBy === "reply") return ((replyScores?.[b.id] ?? -1) - (replyScores?.[a.id] ?? -1));
     // date (most recent first)
     return new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0);
@@ -87,7 +99,7 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete, reply
     const lead = pendingDelete;
     setPendingDelete(null);
     try {
-      await fetch(`${API}/leads/${lead.id}`, { method: "DELETE" });
+      await authFetch(`${API}/leads/${lead.id}`, { method: "DELETE" });
       onDelete?.(lead.id);
     } catch {}
   };
@@ -109,6 +121,30 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete, reply
       }}>
         <h3 style={{ fontSize: 15, fontWeight: 600, color: c.text }}>Leads ({filtered.length})</h3>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          {/* Search leads by name / company / email */}
+          <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+            <span style={{ position: "absolute", left: 10, fontSize: 12, color: c.textDim, pointerEvents: "none" }}>&#128269;</span>
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search name, company, email…"
+              style={{
+                padding: "6px 26px 6px 28px", borderRadius: 6, border: `1px solid ${c.border}`,
+                background: c.surface, color: c.text, fontSize: 12, fontFamily: f.body,
+                outline: "none", width: 210,
+              }}
+            />
+            {search && (
+              <button
+                onClick={() => setSearch("")}
+                title="Clear"
+                style={{
+                  position: "absolute", right: 6, background: "none", border: "none",
+                  color: c.textDim, cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 2,
+                }}
+              >&times;</button>
+            )}
+          </div>
           <div style={{ display: "flex", gap: 6 }}>
             {["all", "hot", "warm", "cold"].map((seg) => (
               <button key={seg} onClick={() => setFilter(seg)} style={{
@@ -120,6 +156,25 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete, reply
                 textTransform: "capitalize", fontWeight: filter === seg ? 600 : 400,
               }}>{seg} ({counts[seg]})</button>
             ))}
+          </div>
+          {/* Status filter (sent listed first) */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 11, color: c.textDim }}>Status:</span>
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              title="Filter by status"
+              style={{
+                padding: "5px 10px", borderRadius: 6, border: `1px solid ${c.border}`,
+                background: c.surface, color: c.text, fontSize: 12, fontFamily: f.body, cursor: "pointer",
+                textTransform: "capitalize",
+              }}
+            >
+              <option value="all">All</option>
+              {statusOptions.map((s) => (
+                <option key={s} value={s}>{s.replace(/_/g, " ")}</option>
+              ))}
+            </select>
           </div>
           {/* Sort control */}
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -135,7 +190,6 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete, reply
             >
               <option value="date">Date</option>
               <option value="name">Name</option>
-              <option value="score">Score</option>
               {replyScores && <option value="reply">Reply %</option>}
             </select>
           </div>
@@ -146,7 +200,7 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete, reply
           <thead>
             <tr style={{ borderBottom: `1px solid ${c.border}` }}>
               {/* Removed email verification column */}
-              {["Name", "Company", "Role", "Score", ...(replyScores ? ["Reply %"] : []), "Segment", "Email", "Emails", "Status", ""].map((h) => (
+              {["Name", "Company", "Role", ...(replyScores ? ["Reply %"] : []), "Segment", "Email", "Emails", "Status", ""].map((h) => (
                 <th key={h} style={{
                   padding: "10px 16px", textAlign: "left", fontSize: 10,
                   color: c.textDim, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase",
@@ -182,17 +236,6 @@ export default function LeadTable({ leads, onSelect, selectedId, onDelete, reply
                   </td>
                   <td style={{ padding: "12px 16px", color: c.text }}>{lead.company}</td>
                   <td style={{ padding: "12px 16px", color: c.textMuted }}>{lead.role}</td>
-                  <td style={{ padding: "12px 16px", minWidth: 80 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ fontFamily: f.mono, fontWeight: 700, color: segmentColor(lead.segment, theme), minWidth: 24 }}>{lead.score}</span>
-                      <div style={{ flex: 1, height: 4, borderRadius: 2, background: c.border, maxWidth: 50 }}>
-                        <div style={{
-                          width: `${lead.score}%`, height: "100%", borderRadius: 2,
-                          background: segmentColor(lead.segment, theme), transition: "width .3s",
-                        }} />
-                      </div>
-                    </div>
-                  </td>
                   {replyScores && (
                     <td style={{ padding: "12px 16px", minWidth: 70 }}>
                       {typeof replyScores[lead.id] === "number" ? (

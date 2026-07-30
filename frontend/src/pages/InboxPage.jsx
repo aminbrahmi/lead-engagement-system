@@ -4,6 +4,7 @@ import { useSearchParams } from "react-router-dom";
 import { useTheme } from "../App";
 import { getDiscussions, getThread, runTracker, getLeadDiscussion, sendDiscussionReply, generateDiscussionReply } from "../api/discussions";
 import { getCampaigns } from "../api/campaigns";
+import { authFetch } from "../api/authFetch";
 
 const SENTIMENT_META = {
   interested:     { label: "Interested",     color: "#00b894", bg: "rgba(0,184,148,0.12)" },
@@ -182,7 +183,7 @@ function ScheduleMeetModal({ discussion, onClose, theme }) {
 
   // Check Google Calendar OAuth status on open
   useEffect(() => {
-    fetch(`${API}/google/calendar/status`)
+    authFetch(`${API}/google/calendar/status`)
       .then(r => r.json())
       .then(d => setGcalStatus(d.connected ? "connected" : d.configured ? "needs_auth" : "not_configured"))
       .catch(() => setGcalStatus("not_configured"));
@@ -209,7 +210,7 @@ function ScheduleMeetModal({ discussion, onClose, theme }) {
     setExtraEmails(prev => prev.filter(e => e !== email));
 
   const handleConnect = async () => {
-    const res  = await fetch(`${API}/google/calendar/auth`);
+    const res  = await authFetch(`${API}/google/calendar/auth`);
     const data = await res.json();
     if (!data.auth_url) return;
 
@@ -218,7 +219,7 @@ function ScheduleMeetModal({ discussion, onClose, theme }) {
     // Poll status every 2 s until connected or popup is closed
     const poll = setInterval(async () => {
       try {
-        const r = await fetch(`${API}/google/calendar/status`);
+        const r = await authFetch(`${API}/google/calendar/status`);
         const d = await r.json();
         if (d.connected) {
           setGcalStatus("connected");
@@ -233,7 +234,7 @@ function ScheduleMeetModal({ discussion, onClose, theme }) {
     setCreating(true);
     setError(null);
     try {
-      const res = await fetch(`${API}/discussions/${discussion.id}/create-meet`, {
+      const res = await authFetch(`${API}/discussions/${discussion.id}/create-meet`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

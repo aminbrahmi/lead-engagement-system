@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from utils.email_verifier import verify_email, should_auto_verify
 from agents.sender_node import send_email, generate_followups
 from memory.storage import update_sequence_status
-from fastapi.responses import Response, RedirectResponse, HTMLResponse
+from fastapi.responses import Response, RedirectResponse, HTMLResponse, JSONResponse
 import urllib.parse
 
 # ── Add project root to path so imports work ──────────────────────────────────
@@ -49,8 +49,10 @@ from memory.storage import (
     get_exclusion_list, add_exclusion, remove_exclusion, remove_exclusion_by_value,
     get_sender_config, save_sender_config, update_sender_config,
     find_similar_campaign, save_campaign_criteria, delete_lead_completely,
+    count_campaign_leads, delete_campaign,
     create_user, get_user_by_email, get_user_by_id,
-    update_user, verify_user_token, set_verification_token,
+    update_user, verify_user_token, set_verification_token, mark_user_verified,
+    get_lead_user_id, get_campaign_user_id, get_discussion_user_id,
 )
 from utils.auth import hash_password, verify_password, create_token, decode_token
 import re as _re
@@ -63,6 +65,34 @@ from utils.json_utils import extract_json_list
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="LeadFlow API", version="1.0.0")
+
+# Paths reachable WITHOUT a login:
+#  - /auth/*                     login / register / google / config / email verify
+#  - /unsubscribe, /resubscribe  lead-facing, protected by their own HMAC token
+#  - /track/*                    click tracking from emails
+#  - /google/calendar/callback   Google OAuth redirect
+#  - docs                        API schema (dev convenience)
+_PUBLIC_PREFIXES = (
+    "/auth/", "/unsubscribe/", "/resubscribe/", "/track/", "/google/calendar/callback",
+)
+_PUBLIC_EXACT = {"/", "/docs", "/redoc", "/openapi.json", "/favicon.ico"}
+
+
+@app.middleware("http")
+async def _require_auth(request, call_next):
+    """Global gate: every endpoint needs a valid JWT except the public ones above.
+    Registered before CORS so the CORS middleware stays outermost and still adds
+    its headers to 401 responses."""
+    path = request.url.path
+    if (request.method == "OPTIONS"
+            or path in _PUBLIC_EXACT
+            or any(path.startswith(p) for p in _PUBLIC_PREFIXES)):
+        return await call_next(request)
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer ") or not decode_token(auth[7:]):
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    return await call_next(request)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -197,6 +227,33 @@ def get_current_user(authorization: str = Header(None)) -> int:
     return int(payload["sub"])
 
 
+def require_lead(lead_id: str, user_id: int = Depends(get_current_user)) -> str:
+    """Dependency: ensure the lead exists AND belongs to the caller (blocks IDOR).
+    Returns the lead_id so handlers can keep using it. 404 (not 403) to avoid
+    leaking whether an id exists for another account."""
+    owner = get_lead_user_id(lead_id)
+    if owner is None or owner != user_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return lead_id
+
+
+def require_campaign(campaign_id: str, user_id: int = Depends(get_current_user)) -> str:
+    """Dependency: ensure the campaign exists AND belongs to the caller."""
+    owner = get_campaign_user_id(campaign_id)
+    if owner is None or owner != user_id:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return campaign_id
+
+
+def require_discussion(discussion_id: int, user_id: int = Depends(get_current_user)) -> int:
+    """Dependency: ensure the discussion exists AND belongs to the caller
+    (ownership derived from the discussion's lead)."""
+    owner = get_discussion_user_id(discussion_id)
+    if owner is None or owner != user_id:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    return discussion_id
+
+
 def _send_verification_email(to_email: str, token: str) -> bool:
     """Send an account-verification email via SMTP."""
     smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -283,6 +340,51 @@ def login(req: LoginRequest):
     return {"token": token, "user": _profile_public(user)}
 
 
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+
+
+@app.get("/auth/config")
+def auth_config():
+    """Public auth config the frontend needs at runtime (no rebuild required)."""
+    return {"google_client_id": GOOGLE_CLIENT_ID}
+
+
+class GoogleAuthRequest(BaseModel):
+    credential: str
+
+
+@app.post("/auth/google")
+def google_auth(req: GoogleAuthRequest):
+    """Sign in / sign up with a Google ID token (from Google Identity Services)."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(503, "Google sign-in is not configured on the server")
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+        info = google_id_token.verify_oauth2_token(
+            req.credential, google_requests.Request(), GOOGLE_CLIENT_ID)
+    except Exception:
+        raise HTTPException(401, "Invalid Google credential")
+
+    email = (info.get("email") or "").strip().lower()
+    if not email or not info.get("email_verified"):
+        raise HTTPException(401, "Google account email is not verified")
+
+    user = get_user_by_email(email)
+    if not user:
+        # New account — Google already verified the email; store an unusable
+        # random password so password-login can never succeed for this user.
+        profile = {"name": info.get("name"), "photo_url": info.get("picture")}
+        created = create_user(email, hash_password(_secrets.token_urlsafe(32)), profile, None)
+        if not created:
+            raise HTTPException(500, "Could not create account")
+        mark_user_verified(created["id"])
+        user = get_user_by_id(created["id"], public=False)
+
+    token = create_token(user["id"], user["email"])
+    return {"token": token, "user": _profile_public(user)}
+
+
 @app.get("/auth/me")
 def auth_me(user_id: int = Depends(get_current_user)):
     user = get_user_by_id(user_id)
@@ -330,9 +432,31 @@ def resend_verification(user_id: int = Depends(get_current_user)):
 
 # ── Campaigns ─────────────────────────────────────────────────────────────────
 
+def _validate_campaign_prompt(prompt: str):
+    """Guard the campaign brief before launching: reject empty/too-short prompts
+    and briefs that clearly aren't a B2B prospecting target."""
+    p = (prompt or "").strip()
+    if len(p) < 15 or len(p.split()) < 4:
+        raise HTTPException(
+            status_code=400,
+            detail="Décrivez votre cible plus précisément — au moins une phrase "
+                   "(rôle/décideur, secteur, localisation…).")
+    try:
+        from tools.prompt_parser import is_targeting_brief
+        ok = is_targeting_brief(p)
+    except Exception:
+        ok = True  # never block if the guard itself errors
+    if not ok:
+        raise HTTPException(
+            status_code=422,
+            detail="Ce prompt ne ressemble pas à une cible de prospection B2B. "
+                   "Précisez qui viser : un rôle/décideur, un secteur, une localisation…")
+
+
 @app.post("/campaigns")
 async def create_campaign(req: CampaignRequest, user_id: int = Depends(get_current_user)):
     """Create a new campaign (owned by the current user) or return existing one."""
+    _validate_campaign_prompt(req.prompt)
     existing = get_campaign_by_prompt(req.prompt, user_id)
 
     if existing:
@@ -369,7 +493,7 @@ def list_campaigns(user_id: int = Depends(get_current_user)):
 
 
 @app.get("/campaigns/{campaign_id}")
-def get_campaign(campaign_id: str):
+def get_campaign(campaign_id: str, owner: str = Depends(require_campaign)):
     """Return campaign detail + its leads."""
     # Try DB first
     campaigns = get_all_campaigns()
@@ -386,6 +510,15 @@ def get_campaign(campaign_id: str):
             campaign[field] = campaign[field].isoformat()
 
     return campaign
+
+
+@app.delete("/campaigns/{campaign_id}")
+def delete_campaign_endpoint(campaign_id: str, owner: str = Depends(require_campaign)):
+    """Delete a campaign and erase all of its leads."""
+    res = delete_campaign(campaign_id)
+    _campaigns.pop(campaign_id, None)
+    _campaign_results.pop(campaign_id, None)
+    return {"status": "deleted", **res}
 
 
 @app.get("/campaigns/{campaign_id}/leads")
@@ -429,7 +562,7 @@ def list_leads(campaign_id: Optional[str] = None, user_id: int = Depends(get_cur
 
 
 @app.get("/leads/{lead_id}")
-def get_lead(lead_id: str):
+def get_lead(lead_id: str, owner: str = Depends(require_lead)):
     all_leads = get_all_leads()
     for lead in all_leads:
         if lead.get("id") == lead_id:
@@ -444,10 +577,18 @@ def get_lead(lead_id: str):
 
 
 @app.delete("/leads/{lead_id}")
-def delete_lead(lead_id: str):
-    """RGPD Art. 17 — erase all personal data for this lead across every store."""
+def delete_lead(lead_id: str, owner: str = Depends(require_lead)):
+    """RGPD Art. 17 — erase all personal data for this lead across every store.
+    If it was the campaign's last lead, the (now empty) campaign is removed too."""
     result = delete_lead_completely(lead_id)
-    return {"status": "deleted", "erased": result}
+    campaign_deleted = False
+    camp_id = result.get("campaign")
+    if camp_id and count_campaign_leads(camp_id) == 0:
+        delete_campaign(camp_id)
+        _campaigns.pop(camp_id, None)
+        _campaign_results.pop(camp_id, None)
+        campaign_deleted = True
+    return {"status": "deleted", "erased": result, "campaign_deleted": campaign_deleted}
 
 
 @app.post("/leads/reply-scores")
@@ -463,6 +604,31 @@ def reply_scores(user_id: int = Depends(get_current_user)):
     scores = predict_scores(leads)
     # available only if the model actually loaded & produced scores (else broken/mismatch)
     return {"available": bool(scores), "scores": scores}
+
+
+class QualityScoreRequest(BaseModel):
+    subject: str = ""
+    body: str = ""
+    lead_id: Optional[str] = None
+    hints: Optional[dict] = None   # author-intent features from the Writer agent
+
+
+@app.post("/email/quality-score")
+def email_quality_score(req: QualityScoreRequest, user_id: int = Depends(get_current_user)):
+    """ML: reply-likelihood (0-100) + actionable suggestions for an email draft."""
+    try:
+        from ml.email_quality_scorer import score_email, is_available
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+    if not is_available():
+        return {"available": False}
+    lead = None
+    if req.lead_id:
+        try:
+            lead = get_lead(req.lead_id)
+        except Exception:
+            lead = None
+    return score_email(req.subject, req.body, lead, req.hints)
 
 
 def _apply_segment_rules(lead: dict) -> None:
@@ -542,7 +708,7 @@ def _is_bogus_email(email: str) -> bool:
 
 
 @app.post("/leads/{lead_id}/re-enrich")
-def re_enrich_lead(lead_id: str):
+def re_enrich_lead(lead_id: str, owner: str = Depends(require_lead)):
     """Re-run research, regenerate A/B emails, and auto-adjust the score for one lead."""
     from agents.enricher_node import _enrich_one
     from agents.writer_node import _generate_one
@@ -668,7 +834,7 @@ def re_enrich_lead(lead_id: str):
 
 
 @app.patch("/leads/{lead_id}")
-def update_lead_status(lead_id: str, update: LeadStatusUpdate):
+def update_lead_status(lead_id: str, update: LeadStatusUpdate, owner: str = Depends(require_lead)):
     from memory.storage import get_conn
 
     with get_conn() as conn:
@@ -681,7 +847,7 @@ def update_lead_status(lead_id: str, update: LeadStatusUpdate):
 
 
 @app.patch("/leads/{lead_id}/fields")
-def update_lead_fields(lead_id: str, update: LeadFieldsUpdate):
+def update_lead_fields(lead_id: str, update: LeadFieldsUpdate, owner: str = Depends(require_lead)):
     """Update any combination of lead fields (email, location, insights, segment…)."""
     with get_conn() as conn:
         cursor = conn.cursor()
@@ -717,7 +883,7 @@ def update_lead_fields(lead_id: str, update: LeadFieldsUpdate):
 # ── Campaign events / timeline ────────────────────────────────────────────────
 
 @app.get("/campaigns/{campaign_id}/events")
-def get_events(campaign_id: str):
+def get_events(campaign_id: str, owner: str = Depends(require_campaign)):
     events = get_campaign_events(campaign_id)
     return {"events": events}
 
@@ -725,14 +891,14 @@ def get_events(campaign_id: str):
 # ── Analyst (Agent 7) — reports, metrics, A/B, PDF ────────────────────────────
 
 @app.get("/analytics/campaign/{campaign_id}")
-def analytics_campaign(campaign_id: str, recommendations: bool = True):
+def analytics_campaign(campaign_id: str, recommendations: bool = True, owner: str = Depends(require_campaign)):
     """Full analyst report for one campaign (metrics + A/B + recommendations)."""
     from agents.analyst_node import build_campaign_report
     return build_campaign_report(campaign_id, with_recommendations=recommendations)
 
 
 @app.get("/analytics/campaign/{campaign_id}/pdf")
-def analytics_campaign_pdf(campaign_id: str):
+def analytics_campaign_pdf(campaign_id: str, owner: str = Depends(require_campaign)):
     """Download a PDF performance report for one campaign."""
     from agents.analyst_node import build_campaign_report
     from agents.analyst_pdf import build_campaign_pdf
@@ -746,18 +912,18 @@ def analytics_campaign_pdf(campaign_id: str):
 
 
 @app.get("/analytics/weekly")
-def analytics_weekly(recommendations: bool = True):
-    """Weekly report aggregating all campaigns."""
+def analytics_weekly(recommendations: bool = True, user_id: int = Depends(get_current_user)):
+    """Weekly report aggregating the caller's campaigns."""
     from agents.analyst_node import build_weekly_report
-    return build_weekly_report(with_recommendations=recommendations)
+    return build_weekly_report(with_recommendations=recommendations, user_id=user_id)
 
 
 @app.get("/analytics/weekly/pdf")
-def analytics_weekly_pdf():
-    """Download the weekly PDF report across all campaigns."""
+def analytics_weekly_pdf(user_id: int = Depends(get_current_user)):
+    """Download the weekly PDF report across the caller's campaigns."""
     from agents.analyst_node import build_weekly_report
     from agents.analyst_pdf import build_weekly_pdf
-    report = build_weekly_report(with_recommendations=True)
+    report = build_weekly_report(with_recommendations=True, user_id=user_id)
     pdf = build_weekly_pdf(report)
     fname = f"weekly_report_{datetime.now().strftime('%Y%m%d')}.pdf"
     return Response(
@@ -769,17 +935,17 @@ def analytics_weekly_pdf():
 # ── Exclusion list ────────────────────────────────────────────────────────────
 
 @app.get("/exclusions")
-def list_exclusions():
-    return {"exclusions": get_exclusion_list()}
+def list_exclusions(user_id: int = Depends(get_current_user)):
+    return {"exclusions": get_exclusion_list(user_id=user_id)}
 
 @app.post("/exclusions")
-def create_exclusion(exc: ExclusionCreate):
-    add_exclusion(exc.value, exc.type, exc.reason)
+def create_exclusion(exc: ExclusionCreate, user_id: int = Depends(get_current_user)):
+    add_exclusion(exc.value, exc.type, exc.reason, user_id=user_id)
     return {"status": "added"}
 
 @app.delete("/exclusions/{exclusion_id}")
-def delete_exclusion(exclusion_id: int):
-    remove_exclusion(exclusion_id)
+def delete_exclusion(exclusion_id: int, user_id: int = Depends(get_current_user)):
+    remove_exclusion(exclusion_id, user_id=user_id)
     return {"status": "removed"}
 
 
@@ -807,7 +973,7 @@ def create_sender(sender: SenderCreate):
 # ── Lead A/B emails ───────────────────────────────────────────────────────────
 
 @app.get("/leads/{lead_id}/emails")
-def get_lead_emails(lead_id: str):
+def get_lead_emails(lead_id: str, owner: str = Depends(require_lead)):
     """Get A/B email variants for a lead."""
     all_leads = get_all_leads()
     for lead in all_leads:
@@ -837,7 +1003,7 @@ def get_lead_emails(lead_id: str):
 
 
 @app.patch("/leads/{lead_id}/emails/{variant}")
-def update_lead_email_variant(lead_id: str, variant: str, update: EmailUpdate):
+def update_lead_email_variant(lead_id: str, variant: str, update: EmailUpdate, owner: str = Depends(require_lead)):
     """Update a specific A/B variant email."""
     with get_conn() as conn:
         cursor = conn.cursor()
@@ -883,7 +1049,7 @@ def update_lead_email_variant(lead_id: str, variant: str, update: EmailUpdate):
 # ── Export ────────────────────────────────────────────────────────────────────
 
 @app.get("/campaigns/{campaign_id}/export")
-def export_campaign_csv(campaign_id: str):
+def export_campaign_csv(campaign_id: str, owner: str = Depends(require_campaign)):
     """Export campaign leads as CSV."""
     import csv
     import io
@@ -1062,7 +1228,7 @@ class EmailAddressUpdate(BaseModel):
 # ── Email Routes ──────────────────────────────────────────────────────────────
 
 @app.post("/leads/{lead_id}/verify-email")
-async def verify_lead_email(lead_id: str, req: EmailVerifyRequest):
+async def verify_lead_email(lead_id: str, req: EmailVerifyRequest, owner: str = Depends(require_lead)):
     """
     Verify a lead's email address.
     - Auto-verifies if from trusted source (Hunter, FTL, Apollo)
@@ -1095,7 +1261,7 @@ async def verify_lead_email(lead_id: str, req: EmailVerifyRequest):
 
 
 @app.post("/leads/{lead_id}/send-email")
-async def send_lead_email(lead_id: str, req: EmailSendRequest):
+async def send_lead_email(lead_id: str, req: EmailSendRequest, owner: str = Depends(require_lead)):
     """
     Send email to a lead.
     - Sends the selected variant (A or B)
@@ -1197,7 +1363,7 @@ async def send_lead_email(lead_id: str, req: EmailSendRequest):
         final_body = final_body.rstrip() + f"\n\n{company_url}"
 
     # ── CREATE SEQUENCE FIRST so we have sequence_id for link tracking ──
-    from memory.storage import create_full_sequence
+    from memory.storage import create_full_sequence, create_single_sequence
     sequence_ids = []
     if req.send_followups:
         try:
@@ -1218,6 +1384,17 @@ async def send_lead_email(lead_id: str, req: EmailSendRequest):
             )
         except Exception as e:
             print(f"[API] Follow-up sequence error: {e}")
+
+    # Even without follow-ups, create a single sequence row so the click-tracking
+    # link is embedded (otherwise the company link goes straight to the site, untracked).
+    if not sequence_ids:
+        try:
+            sequence_ids = [create_single_sequence(
+                lead_id, lead["campaign"], req.variant,
+                final_subject, final_body, cc=final_cc,
+            )]
+        except Exception as e:
+            print(f"[API] Single sequence error: {e}")
 
     # ── SEND with sequence_id so the tracked link is embedded ──
     result = send_email(
@@ -1276,7 +1453,7 @@ async def send_lead_email(lead_id: str, req: EmailSendRequest):
 
 
 @app.patch("/leads/{lead_id}/draft-email")
-async def update_draft_email(lead_id: str, req: DraftEmailUpdate):
+async def update_draft_email(lead_id: str, req: DraftEmailUpdate, owner: str = Depends(require_lead)):
     """
     Update a lead's draft email.
     Allows manual editing before sending.
@@ -1376,7 +1553,7 @@ async def batch_verify_emails():
 
  
 @app.patch("/leads/{lead_id}/email")
-async def update_lead_email_address(lead_id: str, email_update: EmailAddressUpdate):
+async def update_lead_email_address(lead_id: str, email_update: EmailAddressUpdate, owner: str = Depends(require_lead)):
     """
     Update a lead's email address.
     Allows changing the recipient for testing.
@@ -1670,14 +1847,20 @@ def track_click(sequence_id: int, url: str = ""):
 
 
 @app.get("/notifications")
-def list_notifications(unread_only: bool = True, limit: int = 50):
+def list_notifications(unread_only: bool = True, limit: int = 50,
+                       user_id: int = Depends(get_current_user)):
     with get_conn() as conn:
         from psycopg2.extras import RealDictCursor
         cursor = conn.cursor(cursor_factory=RealDictCursor)
+        # Only the caller's notifications (ownership via the linked lead)
+        sql = ("SELECT ln.* FROM lead_notifications ln "
+               "JOIN leads l ON l.id = ln.lead_id WHERE l.user_id = %s")
+        params = [user_id]
         if unread_only:
-            cursor.execute("SELECT * FROM lead_notifications WHERE read = FALSE ORDER BY created_at DESC LIMIT %s", (limit,))
-        else:
-            cursor.execute("SELECT * FROM lead_notifications ORDER BY created_at DESC LIMIT %s", (limit,))
+            sql += " AND ln.read = FALSE"
+        sql += " ORDER BY ln.created_at DESC LIMIT %s"
+        params.append(limit)
+        cursor.execute(sql, tuple(params))
         rows = cursor.fetchall()
         for r in rows:
             if r.get("created_at") and hasattr(r["created_at"], "isoformat"):
@@ -1689,24 +1872,31 @@ def list_notifications(unread_only: bool = True, limit: int = 50):
 
 
 @app.post("/notifications/{notif_id}/read")
-def read_notification(notif_id: int):
+def read_notification(notif_id: int, user_id: int = Depends(get_current_user)):
     with get_conn() as conn:
-        conn.cursor().execute("UPDATE lead_notifications SET read = TRUE WHERE id = %s", (notif_id,))
+        conn.cursor().execute(
+            "UPDATE lead_notifications SET read = TRUE WHERE id = %s "
+            "AND lead_id IN (SELECT id FROM leads WHERE user_id = %s)",
+            (notif_id, user_id))
     return {"status": "read"}
 
 @app.post("/notifications/read-all")
-def read_all_notifications():
+def read_all_notifications(user_id: int = Depends(get_current_user)):
     with get_conn() as conn:
-        conn.cursor().execute("UPDATE lead_notifications SET read = TRUE WHERE read = FALSE")
+        conn.cursor().execute(
+            "UPDATE lead_notifications SET read = TRUE WHERE read = FALSE "
+            "AND lead_id IN (SELECT id FROM leads WHERE user_id = %s)",
+            (user_id,))
     return {"status": "ok"}
 
 
 # ── Discussions ───────────────────────────────────────────────────────────────
 
 @app.get("/discussions")
-def list_discussions(campaign_id: Optional[str] = None):
+def list_discussions(campaign_id: Optional[str] = None,
+                     user_id: int = Depends(get_current_user)):
     from memory.storage import get_discussions
-    return {"discussions": get_discussions(campaign_id=campaign_id)}
+    return {"discussions": get_discussions(campaign_id=campaign_id, user_id=user_id)}
 
 
 def _build_full_thread(discussion_id: int, lead_id: str) -> list:
@@ -1756,7 +1946,7 @@ def _build_full_thread(discussion_id: int, lead_id: str) -> list:
 
 
 @app.get("/discussions/{discussion_id}/messages")
-def get_thread(discussion_id: int):
+def get_thread(discussion_id: int, _own: int = Depends(require_discussion)):
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT lead_id FROM discussions WHERE id = %s", (discussion_id,))
@@ -1767,7 +1957,7 @@ def get_thread(discussion_id: int):
 
 
 @app.get("/leads/{lead_id}/discussion")
-def get_lead_discussion_endpoint(lead_id: str):
+def get_lead_discussion_endpoint(lead_id: str, owner: str = Depends(require_lead)):
     from memory.storage import get_lead_discussion
     disc = get_lead_discussion(lead_id)
     if not disc:
@@ -1778,7 +1968,7 @@ def get_lead_discussion_endpoint(lead_id: str):
 
 
 @app.post("/discussions/{discussion_id}/generate-reply")
-async def generate_discussion_reply(discussion_id: int):
+async def generate_discussion_reply(discussion_id: int, _own: int = Depends(require_discussion)):
     """Generate a reply email based on the last received message in a discussion."""
     from psycopg2.extras import RealDictCursor
     from agents.writer_node import generate_reply_from_response
@@ -1837,7 +2027,7 @@ async def generate_discussion_reply(discussion_id: int):
 
 
 @app.post("/discussions/{discussion_id}/reply")
-async def send_discussion_reply(discussion_id: int, req: DiscussionReplyRequest):
+async def send_discussion_reply(discussion_id: int, req: DiscussionReplyRequest, _own: int = Depends(require_discussion)):
     """Send a reply email from within a discussion thread."""
     from psycopg2.extras import RealDictCursor
 
@@ -2079,7 +2269,7 @@ def gcal_callback(code: str = ""):
 
 
 @app.post("/discussions/{discussion_id}/create-meet")
-async def create_google_meet(discussion_id: int, req: ScheduleMeetRequest):
+async def create_google_meet(discussion_id: int, req: ScheduleMeetRequest, _own: int = Depends(require_discussion)):
     """Create a Google Calendar event with Meet link. Returns meet_link."""
     from psycopg2.extras import RealDictCursor
     from googleapiclient.discovery import build
@@ -2187,7 +2377,7 @@ async def run_tracker_endpoint(campaign_id: Optional[str] = None):
 
 
 @app.post("/discussions/{discussion_id}/schedule-meet")
-async def schedule_meet(discussion_id: int, req: ScheduleMeetRequest):
+async def schedule_meet(discussion_id: int, req: ScheduleMeetRequest, _own: int = Depends(require_discussion)):
     """Send a meeting invitation email to the lead for a Google Meet."""
     from psycopg2.extras import RealDictCursor
     from agents.sender_node import send_email

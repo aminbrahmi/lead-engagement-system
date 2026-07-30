@@ -422,11 +422,15 @@ def check_inbox(since_hours: int = 24) -> list:
             from_addr = _decode_header_value(msg.get("From", ""))
             subject = _decode_header_value(msg.get("Subject", ""))
             date_str = _decode_header_value(msg.get("Date", ""))
-            message_id = msg.get("Message-ID", "")
+            # Collapse header-folding whitespace (\r\n + space/tab) that some
+            # servers insert inside Message-ID. Without this the same reply can
+            # yield a slightly different id between polls, so message_id-based
+            # dedup misses and the reply gets stored twice.
+            message_id = " ".join(msg.get("Message-ID", "").split())
             # In-Reply-To may be absent in some clients (Gmail self-reply); fall back to References
-            in_reply_to = msg.get("In-Reply-To", "").strip()
+            in_reply_to = " ".join(msg.get("In-Reply-To", "").split())
             if not in_reply_to:
-                refs = msg.get("References", "").strip()
+                refs = " ".join(msg.get("References", "").split())
                 if refs:
                     in_reply_to = refs.split()[-1]  # last message-id in thread chain
             raw_body = _extract_reply_body(msg)  # full body for calendar parsing
@@ -746,8 +750,12 @@ def _run_tracker_inner(campaign_id: str = None) -> dict:
             with _gc() as _conn:
                 _c = _conn.cursor()
                 if reply_mid:
-                    _c.execute("SELECT id, notification_sent FROM messages WHERE message_id = %s LIMIT 1",
-                               (reply_mid,))
+                    # Compare whitespace-normalised on BOTH sides so a folded id
+                    # ('\r\n <..>') stored earlier still matches a clean one.
+                    _c.execute(
+                        "SELECT id, notification_sent FROM messages "
+                        "WHERE btrim(regexp_replace(message_id, '\\s+', ' ', 'g')) = %s LIMIT 1",
+                        (reply_mid,))
                 else:
                     _c.execute("""SELECT id, notification_sent FROM messages
                                   WHERE lead_id=%s AND direction='received'

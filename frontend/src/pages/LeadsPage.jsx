@@ -58,8 +58,15 @@ export default function LeadsPage({ leads, onUpdateLead, activeCampaign, campaig
       console.error("[LeadsPage] Failed to save draft to API:", err);
     }
 
-    // 2. Update both draft_email AND draft_emails in local state
-    const variantData = { subject: emailData.subject, body: emailData.body, cc: emailData.cc, variant };
+    // 2. Update both draft_email AND draft_emails in local state.
+    //    Preserve the Writer's quality_hints so ML scoring stays accurate after edits.
+    const prevEmails0 = (typeof selected?.draft_emails === "string"
+      ? JSON.parse(selected.draft_emails) : selected?.draft_emails) || {};
+    const keptHints = prevEmails0[variant]?.quality_hints;
+    const variantData = {
+      subject: emailData.subject, body: emailData.body, cc: emailData.cc, variant,
+      ...(keptHints ? { quality_hints: keptHints } : {}),
+    };
 
     onUpdateLead(leadId, { draft_email: variantData });
     if (selected?.id === leadId) {

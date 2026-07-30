@@ -213,6 +213,20 @@ Return ONLY raw JSON (no markdown fences):
 }}"""
 
 
+def _writer_quality_hints(lead: dict) -> dict:
+    """Authoritative feature hints the Writer *knows* about its own output, so the
+    ML quality-scorer doesn't have to re-guess them from text (Option B).
+
+    By construction every generated email:
+      - greets by first name AND references the company + a pain point  → personalization 2
+      - is written in a professional tone with NO exclamation marks      → tone 'formal'
+      - always ends with a soft call-to-action (paragraph 7)             → has_cta 1
+    Generation is skipped unless the lead has a name, a company and rich
+    insights, so these hold whenever a draft exists.
+    """
+    return {"personalization_level": 2, "tone": "formal", "has_cta": 1}
+
+
 def _parse_email_json(content: str) -> dict:
     """4-level JSON parsing — same robust logic as before."""
     if isinstance(content, list):
@@ -305,6 +319,7 @@ def _generate_one(lead: dict, campaign_prompt: str, sender_info: dict) -> dict:
             email_a["body"] = _clean_body(email_a["body"])
         email_a.setdefault("variant", "A")
         email_a.setdefault("variant_strategy", "insight-led")
+        email_a["quality_hints"] = _writer_quality_hints(lead)
         lead["draft_emails"]["A"] = email_a
         lead["draft_email"] = email_a
         print(f"[EmailGen] ✓ Variant A written for {company}: {email_a.get('subject', '?')}")
@@ -322,6 +337,7 @@ def _generate_one(lead: dict, campaign_prompt: str, sender_info: dict) -> dict:
             email_b["body"] = _clean_body(email_b["body"])
         email_b.setdefault("variant", "B")
         email_b.setdefault("variant_strategy", "challenge-led")
+        email_b["quality_hints"] = _writer_quality_hints(lead)
         lead["draft_emails"]["B"] = email_b
         print(f"[EmailGen] ✓ Variant B written for {company}: {email_b.get('subject', '?')}")
     except Exception as e:

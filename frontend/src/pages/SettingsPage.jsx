@@ -97,14 +97,22 @@ export default function SettingsPage() {
         {/* Photo */}
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           <div style={{
+            position: "relative",
             width: 64, height: 64, borderRadius: 32, overflow: "hidden", flexShrink: 0,
             background: c.accentGlow, border: `1px solid ${c.border}`,
             display: "flex", alignItems: "center", justifyContent: "center",
             color: c.accent, fontWeight: 700, fontSize: 24,
           }}>
-            {form.photo_url
-              ? <img src={form.photo_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-              : (form.name?.[0]?.toUpperCase() || user?.email?.[0]?.toUpperCase() || "?")}
+            {form.name?.[0]?.toUpperCase() || user?.email?.[0]?.toUpperCase() || "?"}
+            {form.photo_url && (
+              <img
+                src={form.photo_url}
+                alt=""
+                referrerPolicy="no-referrer"
+                onError={(e) => { e.currentTarget.style.display = "none"; }}
+                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }}
+              />
+            )}
           </div>
           <label style={{ fontSize: 13, color: c.accent, cursor: "pointer", fontWeight: 600 }}>
             {form.photo_url ? "Change profile photo" : "Add profile photo"}

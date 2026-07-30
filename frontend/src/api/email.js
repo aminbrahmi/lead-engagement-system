@@ -1,3 +1,4 @@
+import { authFetch } from "./authFetch";
 // frontend/src/api/email.js — Email API functions
 
 const API_BASE = 'http://localhost:8000';
@@ -8,7 +9,7 @@ const API_BASE = 'http://localhost:8000';
  * SMTP-verifies for other sources
  */
 export async function verifyEmail(leadId, email, emailSource) {
-  const response = await fetch(`${API_BASE}/leads/${leadId}/verify-email`, {
+  const response = await authFetch(`${API_BASE}/leads/${leadId}/verify-email`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -32,7 +33,7 @@ export async function verifyEmail(leadId, email, emailSource) {
  * Creates follow-up sequence (J+3, J+7, J+14)
  */
 export async function sendEmail(leadId, variant = 'A', sendFollowups = true) {
-  const response = await fetch(`${API_BASE}/leads/${leadId}/send-email`, {
+  const response = await authFetch(`${API_BASE}/leads/${leadId}/send-email`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -54,7 +55,7 @@ export async function sendEmail(leadId, variant = 'A', sendFollowups = true) {
  * Allows manual editing before sending
  */
 export async function updateDraftEmail(leadId, variant, subject, body, cc) {
-  const response = await fetch(`${API_BASE}/leads/${leadId}/draft-email`, {
+  const response = await authFetch(`${API_BASE}/leads/${leadId}/draft-email`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -79,7 +80,7 @@ export async function updateDraftEmail(leadId, variant, subject, body, cc) {
  * SMTP-verifies the rest
  */
 export async function batchVerifyEmails() {
-  const response = await fetch(`${API_BASE}/leads/batch-verify`, {
+  const response = await authFetch(`${API_BASE}/leads/batch-verify`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
   });
@@ -96,7 +97,7 @@ export async function batchVerifyEmails() {
  * Get lead sequence (all emails in sequence)
  */
 export async function getLeadSequence(leadId) {
-  const response = await fetch(`${API_BASE}/leads/${leadId}/sequence`);
+  const response = await authFetch(`${API_BASE}/leads/${leadId}/sequence`);
   
   if (!response.ok) {
     const error = await response.json();

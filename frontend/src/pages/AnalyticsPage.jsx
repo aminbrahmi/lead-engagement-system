@@ -1,5 +1,6 @@
 // src/pages/AnalyticsPage.jsx — Agent Analyst dashboard
 import React, { useState, useEffect, useCallback } from "react";
+import { authFetch } from "../api/authFetch";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend,
@@ -61,6 +62,23 @@ export default function AnalyticsPage({ leads, campaigns = [], activeCampaign })
   }, [load]);
 
   const pdfHref = mode === "weekly" ? weeklyPdfUrl() : (campaignId ? campaignPdfUrl(campaignId) : "#");
+
+  // Authenticated PDF download: a plain <a href> can't send the JWT, so fetch the
+  // file as a blob (with the token) and trigger the download from memory.
+  const downloadPdf = async () => {
+    if (pdfHref === "#") return;
+    try {
+      const res = await authFetch(pdfHref);
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = mode === "weekly" ? "weekly-report.pdf" : "campaign-report.pdf";
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch { /* ignore */ }
+  };
 
   // ── Empty state ──
   if (!campaigns.length && mode === "campaign") {
@@ -148,10 +166,8 @@ export default function AnalyticsPage({ leads, campaigns = [], activeCampaign })
           )}
         </div>
 
-        <a
-          href={pdfHref}
-          target="_blank"
-          rel="noreferrer"
+        <button
+          onClick={downloadPdf}
           style={{
             padding: "8px 16px", borderRadius: 8, border: "none",
             background: c.accent, color: "#fff", fontSize: 13, fontWeight: 600,
@@ -160,7 +176,7 @@ export default function AnalyticsPage({ leads, campaigns = [], activeCampaign })
           }}
         >
           &#11015; Download PDF report
-        </a>
+        </button>
       </div>
 
       {error && (

@@ -249,12 +249,16 @@ def build_campaign_report(campaign_id: str, with_recommendations: bool = True) -
     }
 
 
-def build_weekly_report(with_recommendations: bool = True) -> dict:
-    """Aggregate report across all campaigns active in the last 7 days."""
+def build_weekly_report(with_recommendations: bool = True, user_id=None) -> dict:
+    """Aggregate report across the user's campaigns active in the last 7 days."""
     since = datetime.now() - timedelta(days=7)
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT id, prompt, created_at FROM campaigns ORDER BY created_at DESC")
+        if user_id is not None:
+            cur.execute("SELECT id, prompt, created_at FROM campaigns WHERE user_id = %s "
+                        "ORDER BY created_at DESC", (user_id,))
+        else:
+            cur.execute("SELECT id, prompt, created_at FROM campaigns ORDER BY created_at DESC")
         campaigns = [dict(r) for r in cur.fetchall()]
 
     per_campaign = []

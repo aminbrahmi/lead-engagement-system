@@ -1,9 +1,31 @@
 // src/pages/AuthPage.jsx — split-screen auth (CSS variables + Tabler icons)
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import { getAuthConfig } from "../api/auth";
 import logo from "../theleadflowlogo.png";
 import "../styles/auth.css";
+
+// Renders Google's official Identity Services button and returns the ID token.
+function GoogleButton({ clientId, onCredential, text = "continue_with" }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!clientId || !ref.current) return;
+    let tries = 0;
+    const render = () => {
+      const g = window.google && window.google.accounts && window.google.accounts.id;
+      if (!g) { if (tries++ < 50) setTimeout(render, 100); return; }  // wait for GIS script
+      g.initialize({ client_id: clientId, callback: (resp) => onCredential(resp.credential) });
+      ref.current.innerHTML = "";
+      g.renderButton(ref.current, {
+        theme: "outline", size: "large", type: "standard",
+        text, shape: "pill", logo_alignment: "center", width: 320,
+      });
+    };
+    render();
+  }, [clientId, text, onCredential]);
+  return <div ref={ref} className="auth-gbtn" />;
+}
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/;
 const NAME_RE  = /^[A-Za-zÀ-ÿ0-9'’.\- ]{1,60}$/;
@@ -27,7 +49,12 @@ const STRENGTH = [
 
 export default function AuthPage({ mode = "login" }) {
   const navigate = useNavigate();
-  const { login, register } = useAuth();
+  const { login, register, googleLogin } = useAuth();
+  const [googleClientId, setGoogleClientId] = useState("");
+
+  useEffect(() => {
+    getAuthConfig().then((c) => setGoogleClientId(c.google_client_id || "")).catch(() => {});
+  }, []);
 
   const [tab, setTab] = useState(mode === "register" ? "signup" : "login");
   const [form, setForm] = useState({ firstName: "", lastName: "", email: "", password: "" });
@@ -80,6 +107,13 @@ export default function AuthPage({ mode = "login" }) {
   };
 
   const googleSignIn = () => setError("Google sign-in is not configured yet.");
+
+  const handleGoogle = async (credential) => {
+    setError(null); setBusy(true);
+    try { await googleLogin(credential); navigate("/"); }
+    catch (err) { setError(err.message || "Google sign-in failed"); }
+    finally { setBusy(false); }
+  };
 
   const st = strength(form.password);
 
@@ -191,9 +225,15 @@ export default function AuthPage({ mode = "login" }) {
                   </button>
                 </form>
                 <div className="auth-divider">or</div>
-                <button className="auth-btn auth-btn--google" onClick={googleSignIn} type="button">
-                  <i className="ti ti-brand-google" /> Continue with Google
-                </button>
+                {googleClientId ? (
+                  <div className="auth-gbtn-wrap">
+                    <GoogleButton clientId={googleClientId} onCredential={handleGoogle} text="continue_with" />
+                  </div>
+                ) : (
+                  <button className="auth-btn auth-btn--google" onClick={googleSignIn} type="button">
+                    <i className="ti ti-brand-google" /> Continue with Google
+                  </button>
+                )}
                 <div className="auth-switch">No account yet? <b onClick={() => switchTab("signup")}>Sign up</b></div>
               </div>
 
@@ -257,9 +297,15 @@ export default function AuthPage({ mode = "login" }) {
                   </button>
                 </form>
                 <div className="auth-divider">or</div>
-                <button className="auth-btn auth-btn--google" onClick={googleSignIn} type="button">
-                  <i className="ti ti-brand-google" /> Sign up with Google
-                </button>
+                {googleClientId ? (
+                  <div className="auth-gbtn-wrap">
+                    <GoogleButton clientId={googleClientId} onCredential={handleGoogle} text="signup_with" />
+                  </div>
+                ) : (
+                  <button className="auth-btn auth-btn--google" onClick={googleSignIn} type="button">
+                    <i className="ti ti-brand-google" /> Sign up with Google
+                  </button>
+                )}
                 <div className="auth-switch">Already have an account? <b onClick={() => switchTab("login")}>Log in</b></div>
               </div>
             </>

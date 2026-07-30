@@ -10,10 +10,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
 if not JWT_SECRET:
-    print("[Auth] ⚠ JWT_SECRET not set — using insecure default. Set JWT_SECRET in .env.")
-    JWT_SECRET = "leadflow-insecure-jwt-secret-change-me"
+    # Fail hard rather than fall back to a public default that would let anyone
+    # forge valid tokens. Set a strong random JWT_SECRET in .env.
+    raise RuntimeError(
+        "JWT_SECRET is not set. Generate one (e.g. `python -c \"import secrets; "
+        "print(secrets.token_urlsafe(48))\"`) and add it to your .env.")
 
 JWT_ALGO = "HS256"
 JWT_TTL_SECONDS = 60 * 60 * 24 * 7   # 7 days

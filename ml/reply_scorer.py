@@ -13,7 +13,7 @@ import pandas as pd
 
 _MODEL = None
 _LOAD_FAILED = False
-_MODEL_PATH = os.path.join(os.path.dirname(__file__), "lead_reply_model.joblib")
+_MODEL_PATH = os.path.join(os.path.dirname(__file__), "best_lead_reply_model.joblib")
 
 
 CITY_TO_COUNTRY = {

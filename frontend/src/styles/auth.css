@@ -126,3 +126,7 @@
 @media (max-width: 860px) {
   .auth-brand { display: none; }
 }
+
+/* Google Identity Services button wrapper */
+.auth-gbtn-wrap { display: flex; justify-content: center; margin-bottom: 4px; }
+.auth-gbtn { color-scheme: light; }

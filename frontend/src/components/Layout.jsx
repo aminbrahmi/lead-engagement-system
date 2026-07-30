@@ -4,6 +4,7 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import logo from "../theleadflowlogo.png";
 import { useTheme } from "../App";
 import { useAuth } from "../context/AuthContext";
+import { authFetch } from "../api/authFetch";
 
 const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
 
@@ -31,6 +32,7 @@ const TYPE_ICON = {
 
 function NotificationBell() {
   const { theme } = useTheme();
+  const c = theme.colors;
   const f = theme.fonts;
   const navigate = useNavigate();
 
@@ -42,7 +44,7 @@ function NotificationBell() {
   // ── Fetch unread notifications ──────────────────
   const fetchNotifs = async () => {
     try {
-      const res  = await fetch(`${API}/notifications?unread_only=true`);
+      const res  = await authFetch(`${API}/notifications?unread_only=true`);
       const data = await res.json();
       const list = data.notifications || [];
       if (!showPanel) setNotifs(list);
@@ -73,7 +75,7 @@ function NotificationBell() {
   // \u2500\u2500 Mark single notification as read \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
   const markRead = async (id) => {
     try {
-      await fetch(`${API}/notifications/${id}/read`, { method: "POST" });
+      await authFetch(`${API}/notifications/${id}/read`, { method: "POST" });
       setNotifs((prev) => prev.filter((n) => n.id !== id));
     } catch {}
   };
@@ -99,7 +101,7 @@ function NotificationBell() {
         style={{
           background: "none", border: "none", cursor: "pointer",
           position: "relative", fontSize: 18, padding: 4,
-          color: unreadCount > 0 ? "#fdcb6e" : "#636e72",
+          color: unreadCount > 0 ? "#fdcb6e" : c.textMuted,
           transition: "color .2s",
         }}
       >
@@ -121,8 +123,8 @@ function NotificationBell() {
         <div style={{
           position: "absolute", top: "calc(100% + 10px)", right: 0,
           width: 360, maxHeight: 440, display: "flex", flexDirection: "column",
-          background: "#1a1d27",
-          border: "1px solid #2a2d3a",
+          background: c.surface,
+          border: `1px solid ${c.border}`,
           borderRadius: 14,
           boxShadow: "0 12px 40px rgba(0,0,0,0.4)",
           zIndex: 200,
@@ -130,27 +132,27 @@ function NotificationBell() {
         }}>
           {/* Panel header */}
           <div style={{
-            padding: "12px 16px", borderBottom: "1px solid #2a2d3a",
+            padding: "12px 16px", borderBottom: `1px solid ${c.border}`,
             display: "flex", alignItems: "center", justifyContent: "space-between",
             flexShrink: 0,
           }}>
-            <span style={{ fontSize: 13, fontWeight: 600, color: "#eaedf4" }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: c.text }}>
               Notifications {unreadCount > 0 && (
                 <span style={{
                   marginLeft: 6, fontSize: 11, padding: "1px 7px", borderRadius: 8,
-                  background: "#ff6b6b22", color: "#ff6b6b", fontWeight: 700,
+                  background: c.hotGlow, color: c.hot, fontWeight: 700,
                 }}>{unreadCount}</span>
               )}
             </span>
             {unreadCount > 0 && (
               <button
                 onClick={async () => {
-                  try { await fetch(`${API}/notifications/read-all`, { method: "POST" }); } catch {}
+                  try { await authFetch(`${API}/notifications/read-all`, { method: "POST" }); } catch {}
                   setNotifs([]);
                   setShowPanel(false);
                 }}
                 style={{
-                  fontSize: 11, color: "#6c5ce7", background: "none", border: "none",
+                  fontSize: 11, color: c.accent, background: "none", border: "none",
                   cursor: "pointer", padding: 0, fontFamily: f?.body,
                 }}
               >
@@ -164,7 +166,7 @@ function NotificationBell() {
             {unreadCount === 0 ? (
               <div style={{
                 padding: 32, textAlign: "center",
-                fontSize: 13, color: "#525975", lineHeight: 1.8,
+                fontSize: 13, color: c.textDim, lineHeight: 1.8,
               }}>
                 No new notifications
               </div>
@@ -177,28 +179,28 @@ function NotificationBell() {
                     onClick={() => handleClick(n)}
                     style={{
                       padding: "12px 16px",
-                      borderBottom: "1px solid #2a2d3a",
+                      borderBottom: `1px solid ${c.border}`,
                       display: "flex", alignItems: "flex-start", gap: 12,
                       cursor: "pointer",
                       transition: "background .12s",
                     }}
-                    onMouseEnter={(e) => e.currentTarget.style.background = "#242736"}
+                    onMouseEnter={(e) => e.currentTarget.style.background = c.surfaceAlt}
                     onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
                   >
                     <span style={{ fontSize: 18, flexShrink: 0, lineHeight: 1 }}>
                       {TYPE_ICON[n.type] || "\u2709\uFE0F"}
                     </span>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, color: "#eaedf4", lineHeight: 1.5 }}>
+                      <div style={{ fontSize: 13, color: c.text, lineHeight: 1.5 }}>
                         {n.message}
                       </div>
                       <div style={{
-                        fontSize: 11, color: "#525975", marginTop: 3,
+                        fontSize: 11, color: c.textDim, marginTop: 3,
                         display: "flex", alignItems: "center", gap: 8,
                       }}>
                         <span>{n.created_at ? new Date(n.created_at).toLocaleString("en-US", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : ""}</span>
                         {isReply && (
-                          <span style={{ color: "#6c5ce7", fontWeight: 600 }}>
+                          <span style={{ color: c.accent, fontWeight: 600 }}>
                             {"View conversation \u2192"}
                           </span>
                         )}
@@ -246,14 +248,22 @@ function UserMenu() {
   return (
     <div ref={ref} style={{ position: "relative" }}>
       <button onClick={() => setOpen((o) => !o)} title={user?.email} style={{
+        position: "relative",
         width: 32, height: 32, borderRadius: 16, border: `1px solid ${c.border}`,
         background: c.accentGlow, color: c.accent, fontWeight: 700, fontSize: 13,
         cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
         overflow: "hidden", padding: 0,
       }}>
-        {user?.photo_url
-          ? <img src={user.photo_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-          : initial}
+        {initial}
+        {user?.photo_url && (
+          <img
+            src={user.photo_url}
+            alt=""
+            referrerPolicy="no-referrer"
+            onError={(e) => { e.currentTarget.style.display = "none"; }}
+            style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }}
+          />
+        )}
       </button>
 
       {open && (

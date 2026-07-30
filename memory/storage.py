@@ -240,6 +240,7 @@ def init_db():
         # Multi-tenant ownership
         cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS user_id INTEGER")
         cursor.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS user_id INTEGER")
+        cursor.execute("ALTER TABLE exclusion_list ADD COLUMN IF NOT EXISTS user_id INTEGER")
         _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_campaigns_user ON campaigns(user_id)")
         _safe_index(cursor, "CREATE INDEX IF NOT EXISTS idx_leads_user ON leads(user_id)")
         cursor.execute("ALTER TABLE email_sequences ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ")
@@ -406,6 +407,15 @@ def verify_user_token(token: str) -> bool:
             (token,),
         )
         return cursor.fetchone() is not None
+
+
+def mark_user_verified(user_id: int):
+    """Mark a user's email verified (used for Google sign-in — Google already
+    verified the address, so no email confirmation is needed)."""
+    with get_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE users SET email_verified = TRUE, verification_token = NULL WHERE id = %s",
+            (user_id,))
 
 
 def set_verification_token(user_id: int, token: str):
@@ -628,6 +638,35 @@ def save_leads(leads: list, campaign_prompt: str, user_id=None) -> dict:
 
 
 # ── Read queries ──────────────────────────────────────────────────────────────
+
+def get_lead_user_id(lead_id: str):
+    """Return the owner user_id of a lead (or None if the lead doesn't exist)."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM leads WHERE id = %s", (lead_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+
+def get_campaign_user_id(campaign_id: str):
+    """Return the owner user_id of a campaign (or None if it doesn't exist)."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM campaigns WHERE id = %s", (campaign_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+
+def get_discussion_user_id(discussion_id):
+    """Return the owner user_id of a discussion (via its linked lead)."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT l.user_id FROM discussions d JOIN leads l ON l.id = d.lead_id "
+            "WHERE d.id = %s", (discussion_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
 
 def get_all_leads(status: str = None, user_id=None) -> list:
     init_db()
@@ -973,45 +1012,49 @@ def find_similar_campaign(criteria: dict) -> dict | None:
 
 # ── Exclusion list ───────────────────────────────────────────────────────────
 
-def add_exclusion(value: str, exc_type: str, reason: str = None):
-    """Add a company or domain to the exclusion list (idempotent).
+def add_exclusion(value: str, exc_type: str, reason: str = None, user_id=None):
+    """Add a company or domain to the exclusion list (idempotent, per user).
     exc_type: 'company' | 'domain' | 'email'
     """
     val = value.lower().strip()
     with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id FROM exclusion_list WHERE type = %s AND value = %s",
-            (exc_type, val)
+            "SELECT id FROM exclusion_list WHERE type = %s AND value = %s "
+            "AND user_id IS NOT DISTINCT FROM %s",
+            (exc_type, val, user_id)
         )
         if cursor.fetchone():
-            return  # already excluded — don't duplicate
+            return  # already excluded for this user — don't duplicate
         cursor.execute("""
-            INSERT INTO exclusion_list (value, type, reason)
-            VALUES (%s, %s, %s)
-        """, (val, exc_type, reason))
+            INSERT INTO exclusion_list (value, type, reason, user_id)
+            VALUES (%s, %s, %s, %s)
+        """, (val, exc_type, reason, user_id))
 
 
-def remove_exclusion_by_value(value: str, exc_type: str = None) -> int:
-    """Remove all exclusion rows matching a value (optionally typed).
+def remove_exclusion_by_value(value: str, exc_type: str = None, user_id=None) -> int:
+    """Remove exclusion rows matching a value (optionally typed / scoped to user).
     Returns number of rows deleted."""
     val = value.lower().strip()
+    clauses, params = ["value = %s"], [val]
+    if exc_type:
+        clauses.append("type = %s"); params.append(exc_type)
+    if user_id is not None:
+        clauses.append("user_id = %s"); params.append(user_id)
     with get_conn() as conn:
         cursor = conn.cursor()
-        if exc_type:
-            cursor.execute(
-                "DELETE FROM exclusion_list WHERE value = %s AND type = %s",
-                (val, exc_type)
-            )
-        else:
-            cursor.execute("DELETE FROM exclusion_list WHERE value = %s", (val,))
+        cursor.execute("DELETE FROM exclusion_list WHERE " + " AND ".join(clauses), tuple(params))
         return cursor.rowcount
 
 
-def get_exclusion_list() -> list:
+def get_exclusion_list(user_id=None) -> list:
     with get_conn() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM exclusion_list ORDER BY created_at DESC")
+        if user_id is not None:
+            cursor.execute("SELECT * FROM exclusion_list WHERE user_id = %s "
+                           "ORDER BY created_at DESC", (user_id,))
+        else:
+            cursor.execute("SELECT * FROM exclusion_list ORDER BY created_at DESC")
         rows = cursor.fetchall()
         for r in rows:
             if r.get("created_at") and hasattr(r["created_at"], "isoformat"):
@@ -1019,13 +1062,19 @@ def get_exclusion_list() -> list:
         return [dict(r) for r in rows]
 
 
-def remove_exclusion(exclusion_id: int):
+def remove_exclusion(exclusion_id: int, user_id=None):
     with get_conn() as conn:
-        conn.cursor().execute("DELETE FROM exclusion_list WHERE id = %s", (exclusion_id,))
+        if user_id is not None:
+            conn.cursor().execute(
+                "DELETE FROM exclusion_list WHERE id = %s AND user_id = %s",
+                (exclusion_id, user_id))
+        else:
+            conn.cursor().execute("DELETE FROM exclusion_list WHERE id = %s", (exclusion_id,))
 
 
-def is_excluded(company: str = None, domain: str = None, email: str = None) -> bool:
-    """Check if a company, domain, or email is in the exclusion list."""
+def is_excluded(company: str = None, domain: str = None, email: str = None, user_id=None) -> bool:
+    """Check if a company, domain, or email is excluded. When user_id is given,
+    matches that user's exclusions plus any global (NULL) ones."""
     with get_conn() as conn:
         cursor = conn.cursor()
         checks = []
@@ -1037,10 +1086,15 @@ def is_excluded(company: str = None, domain: str = None, email: str = None) -> b
             checks.append(("email", email.lower().strip()))
 
         for exc_type, val in checks:
-            cursor.execute(
-                "SELECT id FROM exclusion_list WHERE type = %s AND value = %s",
-                (exc_type, val)
-            )
+            if user_id is not None:
+                cursor.execute(
+                    "SELECT id FROM exclusion_list WHERE type = %s AND value = %s "
+                    "AND (user_id = %s OR user_id IS NULL)",
+                    (exc_type, val, user_id))
+            else:
+                cursor.execute(
+                    "SELECT id FROM exclusion_list WHERE type = %s AND value = %s",
+                    (exc_type, val))
             if cursor.fetchone():
                 return True
     return False
@@ -1055,16 +1109,16 @@ def delete_lead_completely(lead_id: str) -> dict:
 
     Returns a summary of what was removed.
     """
-    result = {"db": 0, "json": 0, "chroma": False, "name": None, "company": None}
+    result = {"db": 0, "json": 0, "chroma": False, "name": None, "company": None, "campaign": None}
 
     # ── 1. PostgreSQL — delete child rows first, then the lead ──
     try:
         with get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT name, company FROM leads WHERE id = %s", (lead_id,))
+            cursor.execute("SELECT name, company, campaign FROM leads WHERE id = %s", (lead_id,))
             row = cursor.fetchone()
             if row:
-                result["name"], result["company"] = row[0], row[1]
+                result["name"], result["company"], result["campaign"] = row[0], row[1], row[2]
 
             # Child tables with a plain lead_id column (no/partial FK cascade)
             for tbl in ("messages", "email_sequences", "lead_notifications", "notifications"):
@@ -1105,6 +1159,30 @@ def delete_lead_completely(lead_id: str) -> dict:
 
     print(f"[Erase] Lead {lead_id} erased — db={result['db']} json={result['json']} chroma={result['chroma']}")
     return result
+
+
+def count_campaign_leads(campaign_id: str) -> int:
+    """Number of leads still attached to a campaign."""
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM leads WHERE campaign = %s", (campaign_id,))
+        return cursor.fetchone()[0]
+
+
+def delete_campaign(campaign_id: str) -> dict:
+    """Delete a campaign and completely erase all of its leads (+ child rows)."""
+    leads = get_campaign_leads(campaign_id)
+    for l in leads:
+        if l.get("id"):
+            delete_lead_completely(l["id"])
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM campaign_events WHERE campaign_id = %s", (campaign_id,))
+        cursor.execute("DELETE FROM leads WHERE campaign = %s", (campaign_id,))  # safety net
+        cursor.execute("DELETE FROM campaigns WHERE id = %s", (campaign_id,))
+        deleted = cursor.rowcount
+    print(f"[Campaign] Deleted campaign {campaign_id} ({len(leads)} leads erased)")
+    return {"deleted_campaign": deleted, "deleted_leads": len(leads)}
 
 
 # ── Sender config ────────────────────────────────────────────────────────────
@@ -1234,10 +1312,35 @@ def create_full_sequence(lead_id: str, campaign_id: str, variant: str,
     return sequence_ids
 
 
-def get_due_sequences() -> list:
-    """Get email sequences due to be sent."""
+def create_single_sequence(lead_id: str, campaign_id: str, variant: str,
+                           subject: str, body: str, cc: str = None) -> int:
+    """Create a single (initial-only) email_sequences row and return its id.
+
+    Used when an email is sent WITHOUT follow-ups: we still need a sequence_id
+    so the click-tracking link can be embedded in the email.
+    """
     now = datetime.now()
-    
+    with get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO email_sequences
+                (lead_id, campaign_id, step, variant, subject, body, cc, status, scheduled_for)
+            VALUES (%s, %s, 0, %s, %s, %s, %s, 'scheduled', %s)
+            RETURNING id
+        """, (lead_id, campaign_id, variant, subject, body, cc, now))
+        return cursor.fetchone()[0]
+
+
+def get_due_sequences() -> list:
+    """Get FOLLOW-UP email sequences due to be sent.
+
+    Step 0 (the initial email) is ALWAYS sent by the send endpoint / pipeline and
+    marked 'sent' right after. It is created as 'scheduled' (scheduled_for=now) only
+    so a tracking id exists — so we must exclude step 0 here, otherwise the 60s
+    background scheduler can race the initial SMTP send and deliver it twice.
+    """
+    now = datetime.now()
+
     with get_conn() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute("""
@@ -1245,6 +1348,7 @@ def get_due_sequences() -> list:
             FROM email_sequences es
             JOIN leads l ON es.lead_id = l.id
             WHERE es.status = 'scheduled' AND es.scheduled_for <= %s
+              AND es.step > 0
             ORDER BY es.scheduled_for
         """, (now,))
         return [dict(row) for row in cursor.fetchall()]
@@ -1364,41 +1468,33 @@ def add_message(discussion_id: int, lead_id: str, direction: str,
         return new_id
 
 
-def get_discussions(campaign_id: str = None, limit: int = 100) -> list:
-    """Return discussions with lead info and last message preview."""
+def get_discussions(campaign_id: str = None, limit: int = 100, user_id=None) -> list:
+    """Return discussions with lead info and last message preview.
+    Scoped to user_id when given (ownership derived from the linked lead)."""
+    clauses, params = [], []
+    if campaign_id:
+        clauses.append("d.campaign_id = %s"); params.append(campaign_id)
+    if user_id is not None:
+        clauses.append("l.user_id = %s"); params.append(user_id)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
     with get_conn() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        if campaign_id:
-            cursor.execute("""
-                SELECT d.*, l.name AS lead_name, l.company, l.email AS lead_email,
-                       l.segment,
-                       (SELECT body FROM messages WHERE discussion_id = d.id
-                        ORDER BY created_at DESC LIMIT 1) AS last_body,
-                       (SELECT direction FROM messages WHERE discussion_id = d.id
-                        ORDER BY created_at DESC LIMIT 1) AS last_direction,
-                       (SELECT COUNT(*) FROM messages WHERE discussion_id = d.id
-                        AND direction = 'received') AS reply_count
-                FROM discussions d
-                JOIN leads l ON l.id = d.lead_id
-                WHERE d.campaign_id = %s
-                ORDER BY d.last_message_at DESC
-                LIMIT %s
-            """, (campaign_id, limit))
-        else:
-            cursor.execute("""
-                SELECT d.*, l.name AS lead_name, l.company, l.email AS lead_email,
-                       l.segment,
-                       (SELECT body FROM messages WHERE discussion_id = d.id
-                        ORDER BY created_at DESC LIMIT 1) AS last_body,
-                       (SELECT direction FROM messages WHERE discussion_id = d.id
-                        ORDER BY created_at DESC LIMIT 1) AS last_direction,
-                       (SELECT COUNT(*) FROM messages WHERE discussion_id = d.id
-                        AND direction = 'received') AS reply_count
-                FROM discussions d
-                JOIN leads l ON l.id = d.lead_id
-                ORDER BY d.last_message_at DESC
-                LIMIT %s
-            """, (limit,))
+        cursor.execute(f"""
+            SELECT d.*, l.name AS lead_name, l.company, l.email AS lead_email,
+                   l.segment,
+                   (SELECT body FROM messages WHERE discussion_id = d.id
+                    ORDER BY created_at DESC LIMIT 1) AS last_body,
+                   (SELECT direction FROM messages WHERE discussion_id = d.id
+                    ORDER BY created_at DESC LIMIT 1) AS last_direction,
+                   (SELECT COUNT(*) FROM messages WHERE discussion_id = d.id
+                    AND direction = 'received') AS reply_count
+            FROM discussions d
+            JOIN leads l ON l.id = d.lead_id
+            {where}
+            ORDER BY d.last_message_at DESC
+            LIMIT %s
+        """, tuple(params))
         rows = cursor.fetchall()
         result = []
         for r in rows:

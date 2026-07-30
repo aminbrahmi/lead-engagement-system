@@ -2,6 +2,8 @@
 import React, { useState, useEffect } from "react";
 import { useTheme } from "../App";
 import { sendSingleLead } from "../api/sequences";
+import { scoreEmailQuality } from "../api/leads";
+import { authFetch } from "../api/authFetch";
 
 // ── Confirmation Modal ───────────────────────────────────────────────────────
 function ConfirmModal({ open, onConfirm, onCancel, toEmail, subject, variant, theme }) {
@@ -105,6 +107,20 @@ export default function EmailEditor({
   const [sendResult, setSendResult] = useState(null);
   const [isPreview, setIsPreview] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
+  const [quality, setQuality] = useState(null);   // ML reply-likelihood + suggestions
+
+  // Live (debounced) ML quality score as the user edits the draft
+  useEffect(() => {
+    if (!body || !body.trim()) { setQuality(null); return; }
+    let active = true;
+    const t = setTimeout(() => {
+      const hints = (variants[activeVariant] || {}).quality_hints;   // Writer's author-intent features
+      scoreEmailQuality(subject, body, leadId, hints)
+        .then((r) => { if (active) setQuality(r && r.available ? r : null); })
+        .catch(() => { if (active) setQuality(null); });
+    }, 600);
+    return () => { active = false; clearTimeout(t); };
+  }, [subject, body, leadId]);
 
   useEffect(() => {
     const v = variants[activeVariant] || {};
@@ -145,7 +161,7 @@ export default function EmailEditor({
 
       // Send with to_email override — backend uses this instead of DB email
       const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
-      const res = await fetch(`${API}/leads/${leadId}/send-email`, {
+      const res = await authFetch(`${API}/leads/${leadId}/send-email`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -260,6 +276,43 @@ export default function EmailEditor({
           {sendResult.msg}
         </div>
       )}
+
+      {/* ML reply-likelihood + suggestions */}
+      {quality && (() => {
+        const qColor = quality.score >= 60 ? c.green : quality.score >= 40 ? c.warm : c.hot;
+        const qGlow  = quality.score >= 60 ? c.greenGlow : quality.score >= 40 ? c.warmGlow : c.hotGlow;
+        return (
+          <div style={{
+            marginBottom: 12, padding: "12px 16px", borderRadius: 10,
+            background: c.surface, border: `1px solid ${c.border}`,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 1, fontWeight: 700, color: c.textDim, whiteSpace: "nowrap" }}>
+                Reply likelihood
+              </span>
+              <div style={{ flex: 1, height: 6, borderRadius: 3, background: c.border, overflow: "hidden" }}>
+                <div style={{ width: `${quality.score}%`, height: "100%", borderRadius: 3, background: qColor, transition: "width .3s" }} />
+              </div>
+              <span style={{
+                fontFamily: f.mono, fontSize: 15, fontWeight: 700, color: qColor,
+                minWidth: 52, textAlign: "right", padding: "1px 8px", borderRadius: 4, background: qGlow,
+              }}>{quality.score}%</span>
+            </div>
+            {quality.suggestions && quality.suggestions.length > 0 && (
+              <ul style={{ margin: "10px 0 0", padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 6 }}>
+                {quality.suggestions.map((s, i) => (
+                  <li key={i} style={{ fontSize: 12, color: c.textMuted, display: "flex", gap: 8, lineHeight: 1.5 }}>
+                    <span style={{ color: c.accent, fontWeight: 700 }}>&rsaquo;</span>{s}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div style={{ marginTop: 8, fontSize: 10, color: c.textDim }}>
+              ML estimate — predicted reply probability from the email content
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Email form */}
       <div style={{

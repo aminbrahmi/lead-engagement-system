@@ -8,14 +8,25 @@ const EXAMPLE_PROMPTS = [
   "VP Engineering at SaaS startups in London, 50-200 employees",
 ];
 
-export default function CampaignForm({ onLaunch, onViewCampaign, isRunning, campaigns, campaignsLoading }) {
+export default function CampaignForm({ onLaunch, onViewCampaign, onDeleteCampaign, isRunning, campaigns, campaignsLoading }) {
   const { theme } = useTheme();
   const c = theme.colors;
   const f = theme.fonts;
   const [prompt, setPrompt] = useState("");
+  const [confirmId, setConfirmId] = useState(null);   // campaign pending delete confirmation
+  const [err, setErr] = useState(null);
 
   const handleSubmit = () => {
-    if (prompt.trim() && !isRunning) onLaunch(prompt.trim());
+    if (isRunning) return;
+    const p = prompt.trim();
+    const words = p.split(/\s+/).filter(Boolean);
+    // Client-side guard: a real targeting brief is at least a short sentence.
+    if (p.length < 15 || words.length < 4) {
+      setErr("Décrivez votre cible plus précisément — un rôle/décideur, un secteur, une localisation…");
+      return;
+    }
+    setErr(null);
+    onLaunch(p);
   };
 
   // Show DB campaigns if available, otherwise show hardcoded examples
@@ -36,16 +47,21 @@ export default function CampaignForm({ onLaunch, onViewCampaign, isRunning, camp
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <textarea
           value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
+          onChange={(e) => { setPrompt(e.target.value); if (err) setErr(null); }}
           placeholder="e.g. Find CTOs of AI startups in Berlin that raised funding in the last 12 months"
           rows={4}
           style={{
             width: "100%", padding: "16px 20px", borderRadius: 12,
-            background: c.surface, border: `1px solid ${c.border}`, color: c.text,
+            background: c.surface, border: `1px solid ${err ? "#ff6b6b" : c.border}`, color: c.text,
             fontFamily: f.body, fontSize: 15, lineHeight: 1.7, outline: "none", resize: "none",
           }}
           onKeyDown={(e) => { if (e.key === "Enter" && e.metaKey) handleSubmit(); }}
         />
+        {err && (
+          <div style={{ color: "#ff6b6b", fontSize: 13, marginTop: -6, fontFamily: f.body }}>
+            {err}
+          </div>
+        )}
         <button
           onClick={handleSubmit}
           disabled={isRunning || !prompt.trim()}
@@ -116,7 +132,44 @@ export default function CampaignForm({ onLaunch, onViewCampaign, isRunning, camp
                   </span>
 
                   {/* Action buttons — pushed right */}
-                  <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                  <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+                    {/* Delete campaign (with inline confirmation) */}
+                    {confirmId === camp.id ? (
+                      <>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); onDeleteCampaign?.(camp.id); setConfirmId(null); }}
+                          style={{
+                            padding: "5px 12px", borderRadius: 6, border: "none",
+                            background: "#ff6b6b", color: "#fff", fontSize: 12, fontWeight: 600,
+                            cursor: "pointer", fontFamily: f.body,
+                          }}
+                        >
+                          Delete
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setConfirmId(null); }}
+                          style={{
+                            padding: "5px 10px", borderRadius: 6, border: `1px solid ${c.border}`,
+                            background: "transparent", color: c.textMuted, fontSize: 12, fontWeight: 500,
+                            cursor: "pointer", fontFamily: f.body,
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setConfirmId(camp.id); }}
+                        title="Delete campaign"
+                        style={{
+                          padding: "5px 9px", borderRadius: 6, border: `1px solid ${c.border}`,
+                          background: "transparent", color: c.textDim, fontSize: 13,
+                          cursor: "pointer", fontFamily: f.body, lineHeight: 1,
+                        }}
+                      >
+                        &#128465;
+                      </button>
+                    )}
                     <button
                       onClick={() => onViewCampaign(camp)}
                       style={{

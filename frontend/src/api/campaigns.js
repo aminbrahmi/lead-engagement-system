@@ -10,6 +10,9 @@ export const getCampaigns = () =>
 export const getCampaign = (id) =>
   client.get(`/campaigns/${id}`);
 
+export const deleteCampaign = (id) =>
+  client.delete(`/campaigns/${id}`);
+
 export const getCampaignLeads = (id) =>
   client.get(`/campaigns/${id}/leads`);
 

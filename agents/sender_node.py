@@ -251,16 +251,21 @@ def _build_mime_message(sender_config, to_email, subject, body,
         html_body,
     )
 
-    # Wrap company_url for click tracking (overwrites auto-link above)
-    if sequence_id and sender_config.get("company_url"):
-        raw_url = sender_config["company_url"]
-        tracked_url = f"{BASE_URL}/track/click/{sequence_id}?url={urllib.parse.quote(raw_url, safe='')}"
-        # Replace the auto-linked version with the tracked version
-        html_body = re.sub(
-            r'<a href="[^"]*"[^>]*>' + re.escape(raw_url) + r'</a>',
-            f'<a href="{tracked_url}" style="color:#6c5ce7">{raw_url}</a>',
-            html_body,
-        )
+    # Wrap EVERY link in the body for click tracking — not just company_url.
+    # The recipient may click any link (e.g. an LLM-inserted company page like
+    # talan.com/global/fr), so each href is routed through /track/click. Only the
+    # href value is rewritten; visible text and styles are preserved. The
+    # unsubscribe link is added AFTER this block, so it is never wrapped here.
+    if sequence_id:
+        def _wrap_href(m):
+            href = m.group(1)
+            # Skip our own tracking/unsubscribe links, anchors and mailto:
+            if ("/track/click/" in href or "/unsubscribe/" in href
+                    or href.startswith("mailto:") or href.startswith("#")):
+                return m.group(0)
+            tracked = f"{BASE_URL}/track/click/{sequence_id}?url={urllib.parse.quote(href, safe='')}"
+            return f'<a href="{tracked}"'
+        html_body = re.sub(r'<a href="([^"]+)"', _wrap_href, html_body)
 
     # (Open tracking pixel removed — open tracking is disabled.)
 
@@ -357,9 +362,9 @@ def _process_one_lead(lead: dict, campaign_prompt: str, campaign_id: str,
         print(f"[Sender] ✗ Skipping {company} — no email")
         return lead
 
-    # Check exclusion list
+    # Check exclusion list (scoped to this lead's owner + global exclusions)
     domain = email.split("@")[-1] if "@" in email else ""
-    if is_excluded(company=company, domain=domain, email=email):
+    if is_excluded(company=company, domain=domain, email=email, user_id=lead.get("user_id")):
         print(f"[Sender] ✗ Skipping {company} — in exclusion list")
         return lead
 

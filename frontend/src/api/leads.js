@@ -29,3 +29,8 @@ export const reEnrichLead = (id) =>
 
 // ML: predicted reply probability (0-100) for each lead → { available, scores: {id: pct} }
 export const getReplyScores = () => client.post("/leads/reply-scores");
+
+// ML: score an email draft → { available, score, suggestions[], features{} }
+// `hints` are the Writer's author-intent features (personalization/tone/CTA).
+export const scoreEmailQuality = (subject, body, leadId, hints) =>
+  client.post("/email/quality-score", { subject, body, lead_id: leadId, hints });

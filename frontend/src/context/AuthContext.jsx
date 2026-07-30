@@ -47,6 +47,11 @@ export function AuthProvider({ children }) {
     return res;   // includes { user, token, email_sent }
   }, []);
 
+  const googleLogin = useCallback(async (credential) => {
+    const res = await authApi.googleAuth(credential);
+    return _apply(res);
+  }, []);
+
   const updateProfile = useCallback(async (fields) => {
     const updated = await authApi.updateProfile(fields);
     setUser(updated);
@@ -66,7 +71,7 @@ export function AuthProvider({ children }) {
   }, []);
 
   return (
-    <AuthContext.Provider value={{ token, user, loading, isAuthenticated: !!token, login, register, updateProfile, refreshUser, logout }}>
+    <AuthContext.Provider value={{ token, user, loading, isAuthenticated: !!token, login, register, googleLogin, updateProfile, refreshUser, logout }}>
       {children}
     </AuthContext.Provider>
   );
